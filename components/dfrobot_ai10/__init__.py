@@ -36,6 +36,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(DFRobotAI10Component),
         cv.Optional("documented_qr", default=False): cv.boolean,
+        cv.Optional("allow_sensitive_transfers", default=False): cv.boolean,
         cv.Optional("on_enrollment_success"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EnrollmentSuccessTrigger)}),
         cv.Optional("on_enrollment_failed"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EnrollmentFailedTrigger)}),
         cv.Optional("on_recognition_failed"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(RecognitionFailedTrigger)}),
@@ -65,6 +66,7 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     cg.add(var.set_documented_qr(config['documented_qr']))
+    cg.add(var.set_allow_sensitive_transfers(config['allow_sensitive_transfers']))
 
     for conf in config.get(CONF_ON_RECOGNIZED, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)

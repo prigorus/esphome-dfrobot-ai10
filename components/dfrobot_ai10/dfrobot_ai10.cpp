@@ -108,7 +108,7 @@ void DFRobotAI10Component::loop() {
 // ===== Public API (Non-blocking State Machine) =====
 
 bool DFRobotAI10Component::enrollment_command_(uint8_t cmd) {
-  return cmd == CMD_ENROLL_SINGLE || cmd == CMD_ENROLL_DIRECTION || cmd == CMD_ENROLL_INTERACTIVE;
+  return cmd == CMD_ENROLL_SINGLE || cmd == CMD_ENROLL_DIRECTION || cmd == CMD_ENROLL_INTERACTIVE || cmd == 0xFB || cmd == 0xF7;
 }
 void DFRobotAI10Component::invalidate_auth_() {
   recognized_ = false; face_detected_ = false; last_uid_ = 0;
@@ -122,6 +122,7 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   bool enroll = enrollment_command_(cmd) || (cmd == CMD_RESET && (pending_action_ == PENDING_ENROLL || (pending_action_ == PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
   bool verify = cmd == CMD_VERIFY || (cmd == CMD_RESET && pending_action_ == PENDING_VERIFY);
   waiting_reset_ = false; pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  clear_transfer_();
   suppress_verify_ = true; invalidate_auth_(); last_result_ = result;
   if (enroll) enrollment_failed_.call(result);
   if (verify) recognition_failed_.call(result);
@@ -134,6 +135,7 @@ void DFRobotAI10Component::transmit_reset_() {
 }
 void DFRobotAI10Component::send_reset() {
   cancel_stop_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  clear_transfer_();
   suppress_verify_ = true; invalidate_auth_();
   if (setup_done_) transmit_reset_();
 }
@@ -208,7 +210,7 @@ void DFRobotAI10Component::enroll_direction(uint8_t admin, const char *name, uin
   queue_extended_(CMD_ENROLL_DIRECTION, std::move(data), uint32_t(timeout)*1000+3000);
 }
 void DFRobotAI10Component::enroll_interactive(uint8_t admin, const char *name, uint8_t type, uint8_t duplicate, uint8_t timeout) {
-  if (!name || admin > 1 || duplicate > 2) return;
+  if (!name || admin > 1 || type > 1 || duplicate > 2) return;
   std::vector<uint8_t> data(40, 0); data[0] = admin;
   memcpy(data.data()+1, name, std::min<size_t>(strlen(name), 31));
   data[34] = type; data[35] = duplicate; data[36] = timeout;
@@ -218,6 +220,76 @@ void DFRobotAI10Component::query_uvc() { queue_extended_(CMD_UVC_READ, {}); }
 void DFRobotAI10Component::configure_uvc(uint8_t usb, uint8_t bitrate, uint8_t quality, uint8_t attributes) {
   if ((usb != 0x11 && usb != 0x20 && usb != 0x91 && usb != 0xA0) || quality < 10 || quality > 100 || attributes > 3) return;
   queue_extended_(CMD_UVC_WRITE, {usb, bitrate, quality, attributes});
+}
+
+// Sensitive operations are opt-in, stream downloads rather than allocating whole images.
+void DFRobotAI10Component::clear_transfer_() {
+  transfer_sink_ = nullptr;
+  upload_active_ = false;
+  std::fill(upload_bytes_.begin(), upload_bytes_.end(), 0);
+  upload_bytes_.clear();
+}
+void DFRobotAI10Component::send_extended_packet_(uint8_t cmd, const std::vector<uint8_t> &data) {
+  std::vector<uint8_t> packet{cmd,uint8_t(data.size() >> 8),uint8_t(data.size())};
+  packet.insert(packet.end(),data.begin(),data.end());
+  send_packet_(packet.data(),packet.size());
+}
+void DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink) {
+  if (!allow_sensitive_transfers_ || !sink || (kind != 0x71 && kind != 0x72 && kind != 0x74) || resolution > 2 || !prepare_(PENDING_EXTENDED)) return;
+  transfer_sink_ = std::move(sink); transfer_size_ = transfer_received_ = 0; transfer_seq_ = 0; capture_uid_ = 0;
+  extended_cmd_ = kind; extended_data_ = {0};
+  if (kind == 0x74) extended_data_.push_back(resolution);
+  extended_timeout_ms_ = 30000; transmit_reset_();
+}
+void DFRobotAI10Component::export_template(uint16_t uid, uint8_t type, ChunkSink sink) {
+  if (!allow_sensitive_transfers_ || !sink || uid < 1 || uid > 2000 || type < 1 || type > 3 || !prepare_(PENDING_EXTENDED)) return;
+  transfer_sink_ = std::move(sink); transfer_size_ = transfer_received_ = 0; transfer_seq_ = 0; transfer_uid_ = uid;
+  extended_cmd_ = 0xFA; extended_data_ = {0,0,uint8_t(uid>>8),uint8_t(uid),type};
+  extended_timeout_ms_ = 10000; transmit_reset_();
+}
+void DFRobotAI10Component::import_template(uint8_t type, const std::string &name, std::vector<uint8_t> bytes) {
+  // The protocol uses short final chunks; exact multiples need vendor clarification.
+  if (!allow_sensitive_transfers_ || type < 1 || type > 3 || bytes.empty() || bytes.size()>16384 || bytes.size()%246==0 || name.size()>20 || !prepare_(PENDING_EXTENDED)) return;
+  upload_bytes_ = std::move(bytes); upload_active_ = true; transfer_type_ = type;
+  transfer_size_ = upload_bytes_.size(); transfer_received_=0; transfer_seq_=0;
+  extended_cmd_=0xFB; extended_data_={0,0,type};
+  if (!name.empty()) { extended_data_.push_back(name.size()); extended_data_.insert(extended_data_.end(),name.begin(),name.end()); }
+  extended_timeout_ms_=10000; transmit_reset_();
+}
+void DFRobotAI10Component::enroll_photo(uint8_t bio_type, const std::string &name, std::vector<uint8_t> bytes) {
+  if (!allow_sensitive_transfers_ || bio_type > 3 || bytes.empty() || bytes.size()>65536 || name.size()>20 || !prepare_(PENDING_EXTENDED)) return;
+  upload_bytes_=std::move(bytes); upload_active_=true;
+  transfer_size_=upload_bytes_.size(); transfer_received_=0; transfer_seq_=0;
+  uint32_t n=transfer_size_;
+  extended_cmd_=0xF7; extended_data_={0,0,uint8_t(n>>24),uint8_t(n>>16),uint8_t(n>>8),uint8_t(n),bio_type};
+  if (!name.empty()) { extended_data_.push_back(name.size()); extended_data_.insert(extended_data_.end(),name.begin(),name.end()); }
+  extended_timeout_ms_=10000; transmit_reset_();
+}
+void DFRobotAI10Component::set_duplicate_check(bool enabled) { queue_extended_(0xFC,{uint8_t(enabled)}); }
+void DFRobotAI10Component::request_chunk_() {
+  ++transfer_seq_; command_started_=millis(); command_timeout_ms_=10000;
+  if (transfer_sink_) {
+    if (pending_cmd_ == 0xFA)
+      send_extended_packet_(pending_cmd_,{uint8_t(transfer_seq_>>8),uint8_t(transfer_seq_),uint8_t(transfer_uid_>>8),uint8_t(transfer_uid_)});
+    else send_extended_packet_(pending_cmd_,{uint8_t(transfer_seq_)});
+  } else if (upload_active_) {
+    std::vector<uint8_t> data{uint8_t(transfer_seq_>>8),uint8_t(transfer_seq_)};
+    if (pending_cmd_==0xFB) data.push_back(transfer_type_);
+    size_t n=std::min<size_t>(246,transfer_size_-transfer_received_);
+    data.insert(data.end(),upload_bytes_.begin()+transfer_received_,upload_bytes_.begin()+transfer_received_+n);
+    transfer_received_+=n;
+    send_extended_packet_(pending_cmd_,data);
+    std::fill(data.begin(),data.end(),0);
+  }
+}
+void DFRobotAI10Component::handle_chunk_(uint8_t cmd,const uint8_t *data,uint16_t len) {
+  if (waiting_reset_ || cmd!=pending_cmd_ || !transfer_sink_ || !transfer_seq_ || transfer_received_>=transfer_size_) return;
+  size_t expected=std::min<uint32_t>(cmd==0xFA?246:1024,transfer_size_-transfer_received_);
+  if (len!=expected || !transfer_sink_(data,len)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+  transfer_received_+=len;
+  if (transfer_received_==transfer_size_) {
+    pending_cmd_=0; clear_transfer_(); last_result_=RES_SUCCESS; command_result_.call(cmd,RES_SUCCESS);
+  } else request_chunk_();
 }
 
 // ===== Internal Helper: Execute Pending Action =====
@@ -355,6 +427,8 @@ void DFRobotAI10Component::process_packet_(uint8_t msg_id, const uint8_t *payloa
     this->handle_reply_(payload, len);
   } else if (msg_id == MID_NOTE) {
     this->handle_note_(payload, len);
+  } else if (msg_id == 0x71 || msg_id == 0x72 || msg_id == 0x74 || msg_id == 0xFA) {
+    handle_chunk_(msg_id,payload,len);
   } else {
     ESP_LOGW(TAG, "Unknown MsgID: 0x%02X", msg_id);
     // Do not log unsolicited payloads.
@@ -378,6 +452,26 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     return;
   }
   if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && suppress_verify_)) return;
+  if (result == RES_SUCCESS && transfer_sink_ && (cmd==0x71 || cmd==0x72 || cmd==0x74 || cmd==0xFA)) {
+    if (transfer_seq_ || n < (cmd==0x72?6:4)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+    transfer_size_=uint32_t(data[0])<<24 | uint32_t(data[1])<<16 | uint32_t(data[2])<<8 | data[3];
+    if (!transfer_size_ || transfer_size_ > (cmd==0xFA?16384UL:255UL*1024)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+    if (cmd==0x72) capture_uid_=uint16_t(data[4])<<8|data[5];
+    request_chunk_(); return;
+  }
+  if (result == RES_SUCCESS && upload_active_ && (cmd==0xFB || cmd==0xF7)) {
+    if (n!=4 || (uint16_t(data[0])<<8|data[1])!=transfer_seq_) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+    uint16_t uid=uint16_t(data[2])<<8|data[3];
+    if (transfer_received_==transfer_size_) {
+      if (!uid || uid>2000) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+      pending_cmd_=0; clear_transfer_(); last_uid_=uid; user_list_complete_=false; last_result_=result;
+      enrollment_success_.call(uid); command_result_.call(cmd,result);
+    } else {
+      if (uid) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+      request_chunk_();
+    }
+    return;
+  }
   bool continuous = cmd == CMD_VERIFY && stored_continuous_;
   if (result != RES_SUCCESS) {
     if (continuous) {
@@ -471,8 +565,13 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
 
 void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {
   // Full note (sNoteData_t): nid(1) + state(2) + left(2) + top(2) + right(2) + bottom(2) + yaw(2) + pitch(2) + roll(2) = 17 bytes
-  if (suppress_verify_ || waiting_reset_) return;
-  if (len >= 17) {
+  if (len == 1 && payload[0] == 0) {
+    // A spontaneous READY means the previous operation is no longer valid.
+    if (setup_done_ && (waiting_reset_ || pending_cmd_)) fail_command_(waiting_reset_?CMD_RESET:pending_cmd_,RES_ABORTED);
+    module_status_=0; return;
+  }
+  if (waiting_reset_ || (pending_cmd_ != CMD_VERIFY && !enrollment_command_(pending_cmd_))) return;
+  if (len >= 17 && payload[0]==1) {
     uint8_t nid = payload[0];
     int16_t state = (payload[1] << 8) | payload[2];
     int16_t left = (payload[3] << 8) | payload[4];
@@ -531,6 +630,13 @@ const char *DFRobotAI10Component::result_to_str_(uint8_t result) {
     case RES_FAILED_FACE_ENROLLED: return "face already enrolled";
     case RES_FAILED_LIVE_CHECK:    return "liveness check failed";
     case RES_FAILED_TIMEOUT:       return "timeout";
+    case 14: return "authorization failed";
+    case 19: return "file read failed";
+    case 20: return "file write failed";
+    case 21: return "encryption required";
+    case 23: return "RGB image unavailable";
+    case 24: return "photo too large";
+    case 25: return "photo too small";
     default:                       return "unknown";
   }
 }

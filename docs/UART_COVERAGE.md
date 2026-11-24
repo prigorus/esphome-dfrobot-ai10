@@ -19,13 +19,13 @@ All changes below are experimental until compiled and verified on physical hardw
 | 30 version / 93 serial | Queries and getters |
 | 70 QR | Legacy and documented request variants; QR no longer sets biometric authorization |
 | B0 / B1 UVC | Experimental query/configuration; query result logged |
-| 71 / 72 / 74 image | Not implemented: distinct binary transfer protocol |
+| 71 / 72 / 74 image | Experimental opt-in streaming callback; no HA camera entity |
 | 73 enroll captured face | Not implemented: depends on capture and duplicate policy |
-| D7 / F7 photo enroll | Not implemented: multi-packet upload |
-| FA / FB templates | Not implemented: secure storage and transfer required |
+| D7 / F7 photo enroll | F7 experimental upload; D7 not implemented |
+| FA / FB templates | Experimental opt-in streaming export / bounded import; caller owns secure storage |
 | 50 / 52 / 53 encryption | Not implemented: verify cipher/key negotiation and recovery |
 | F6 firmware upgrade | Not implemented: explicit recovery plan required |
-| FC duplicate check | Not implemented |
+| FC duplicate check | Method; leave duplicate checking enabled for access control |
 | FE demo | Deliberately not exposed for access control: bypasses biometric comparison |
 
 The command echo is not a transaction ID. Delayed replies from an earlier instance of the same command cannot always be distinguished. Do not deploy experimental firmware as the only authorization mechanism on an occupied door before hardware validation.
@@ -59,3 +59,8 @@ dfrobot_ai10:
 Other events: `on_command_result(command, result)`, `on_user_info(uid, name, admin)`. Call `query_user(uid)` for each desired ID after list completion. User listing does not automatically restart recognition. Use `get_user_ids()`, `is_user_list_complete()`, `get_module_status()`, `get_firmware_version()`, and `get_serial_number()` in lambdas. Call `start_recognition(timeout, continuous, max_attempts)` to opt into the extended verification request.
 
 No new hardware results are available. The upstream stop workaround is retained because RESET reportedly does not reliably terminate automatic recognition.
+
+## Sensitive transfers (experimental C++ API only)
+Set `allow_sensitive_transfers: true` to use these explicit methods; never publish image or template bytes to logs or Home Assistant text sensors. Downloads require a caller-supplied synchronous chunk sink returning true on success, false on storage failure. The callback must be fast, must not re-enter the component, and must copy data before returning. Completion is reported by `on_command_result`. Capture size is bounded to 255 chunks, template size to 16 KiB; photo upload to 64 KiB. Template imports with lengths exactly divisible by 246 are rejected pending clarification of termination semantics. A failing transfer may have already written partial data or changed module state: discard incomplete backups and inspect the user database before retrying. No built-in storage, encryption or automatic upload is provided.
+
+The vendor manual describes a proprietary session-key derivation for a different module family, not enough to implement interoperable encryption. No key-writing commands or demo bypass are exposed. Physical testing is mandatory.

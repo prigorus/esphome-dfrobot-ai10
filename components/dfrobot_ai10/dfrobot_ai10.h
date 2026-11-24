@@ -132,6 +132,17 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void enroll_direction(uint8_t admin, const char *name, uint8_t direction, uint8_t timeout);
   void enroll_interactive(uint8_t admin, const char *name, uint8_t type, uint8_t duplicate, uint8_t timeout);
   void query_uvc();
+  // Explicit opt-in, streaming to caller-owned storage; never expose biometric bytes to HA logs.
+  using ChunkSink = std::function<bool(const uint8_t *, size_t)>;
+  void set_allow_sensitive_transfers(bool value) { allow_sensitive_transfers_ = value; }
+  void capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink);
+  void export_template(uint16_t uid, uint8_t type, ChunkSink sink);
+  void import_template(uint8_t type, const std::string &name, std::vector<uint8_t> bytes);
+  void enroll_photo(uint8_t bio_type, const std::string &name, std::vector<uint8_t> bytes);
+  void set_duplicate_check(bool enabled);
+  uint32_t get_transfer_size() const { return transfer_size_; }
+  uint32_t get_transfer_received() const { return transfer_received_; }
+  uint16_t get_capture_uid() const { return capture_uid_; }
   void configure_uvc(uint8_t usb, uint8_t bitrate, uint8_t quality, uint8_t attributes);
   void set_documented_qr(bool value) { documented_qr_ = value; }
   uint8_t get_module_status() const { return module_status_; }
@@ -208,6 +219,17 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   CallbackManager<void(uint8_t)> enrollment_failed_, recognition_failed_;
   CallbackManager<void(uint8_t, uint8_t)> command_result_;
   CallbackManager<void(uint16_t, std::string, bool)> user_info_;
+  bool allow_sensitive_transfers_{false};
+  ChunkSink transfer_sink_;
+  uint32_t transfer_size_{0}, transfer_received_{0};
+  uint16_t transfer_seq_{0}, transfer_uid_{0}, capture_uid_{0};
+  uint8_t transfer_type_{0};
+  std::vector<uint8_t> upload_bytes_;
+  bool upload_active_{false};
+  void clear_transfer_();
+  void request_chunk_();
+  void handle_chunk_(uint8_t cmd, const uint8_t *data, uint16_t len);
+  void send_extended_packet_(uint8_t cmd, const std::vector<uint8_t> &data);
   void queue_extended_(uint8_t cmd, std::vector<uint8_t> data, uint32_t timeout_ms = 3000);
   void transmit_reset_();
   void invalidate_auth_();
