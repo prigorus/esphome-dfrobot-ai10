@@ -9,12 +9,13 @@ void DFRobotAI10Component::setup() {
   ESP_LOGI(TAG, "SEN0677 AI Vision Sensor — initializing...");
   // Boot-up delay (datasheet requirement: 900ms–2.5s)
   // This is in setup(), so blocking here is acceptable and safer for init sequence.
-  delay(3000);
+  this->set_timeout("ai10_boot", 3000, [this]() {
+    this->setup_done_ = true;
+    this->send_reset();
+  });
 
   // Send initial reset (mirrors Arduino library begin())
-  this->send_reset();
-  this->setup_done_ = true;
-  ESP_LOGI(TAG, "SEN0677 reset sent, waiting for reply...");
+
 }
 
 void DFRobotAI10Component::dump_config() {
@@ -25,9 +26,13 @@ void DFRobotAI10Component::dump_config() {
 
 void DFRobotAI10Component::loop() {
   // Read bytes one-by-one and feed into state machine parser
-  while (this->available()) {
+  uint32_t now = millis();
+  if (parser_state_ != STATE_WAIT_SYNC_H && now - last_byte_ > 250)
+    parser_state_ = STATE_WAIT_SYNC_H;
+  for (size_t budget = 0; budget < 2048 && this->available(); ++budget) {
     uint8_t byte;
-    this->read_byte(&byte);
+    if (!this->read_byte(&byte)) break;
+    last_byte_ = millis();
 
     switch (this->parser_state_) {
       case STATE_WAIT_SYNC_H:
@@ -54,7 +59,7 @@ void DFRobotAI10Component::loop() {
           this->payload_len_ = (this->header_buf_[1] << 8) | this->header_buf_[2];
           this->payload_pos_ = 0;
 
-          if (this->payload_len_ > 280) {
+          if (this->payload_len_ >= sizeof(this->payload_buf_)) {
             ESP_LOGW(TAG, "Payload too large: %d bytes, resetting parser", this->payload_len_);
             this->parser_state_ = STATE_WAIT_SYNC_H;
           } else {
@@ -87,7 +92,11 @@ void DFRobotAI10Component::loop() {
   }
 
   // Status log every 10 seconds
-  uint32_t now = millis();
+  now = millis();
+  if ((waiting_reset_ || pending_cmd_) && now - command_started_ > command_timeout_ms_) {
+    uint8_t cmd = waiting_reset_ ? CMD_RESET : pending_cmd_;
+    fail_command_(cmd, RES_FAILED_TIMEOUT);
+  }
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
     this->last_status_log_ = now;
     ESP_LOGD(TAG, "Parser state: %s, last result: %s",
@@ -98,99 +107,117 @@ void DFRobotAI10Component::loop() {
 
 // ===== Public API (Non-blocking State Machine) =====
 
+bool DFRobotAI10Component::enrollment_command_(uint8_t cmd) {
+  return cmd == CMD_ENROLL_SINGLE || cmd == CMD_ENROLL_DIRECTION || cmd == CMD_ENROLL_INTERACTIVE;
+}
+void DFRobotAI10Component::invalidate_auth_() {
+  recognized_ = false; face_detected_ = false; last_uid_ = 0;
+  last_user_name_.clear(); last_type_ = TYPE_NONE; last_admin_ = false;
+}
+void DFRobotAI10Component::cancel_stop_() {
+  cancel_timeout("ai10_stop_override");
+  cancel_timeout("ai10_stop_final");
+}
+void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
+  bool enroll = enrollment_command_(cmd) || (cmd == CMD_RESET && (pending_action_ == PENDING_ENROLL || (pending_action_ == PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
+  bool verify = cmd == CMD_VERIFY || (cmd == CMD_RESET && pending_action_ == PENDING_VERIFY);
+  waiting_reset_ = false; pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  suppress_verify_ = true; invalidate_auth_(); last_result_ = result;
+  if (enroll) enrollment_failed_.call(result);
+  if (verify) recognition_failed_.call(result);
+  command_result_.call(cmd, result);
+}
+void DFRobotAI10Component::transmit_reset_() {
+  uint8_t data[] = {CMD_RESET, 0, 0};
+  waiting_reset_ = true; command_started_ = millis(); command_timeout_ms_ = 3000;
+  send_packet_(data, sizeof(data));
+}
 void DFRobotAI10Component::send_reset() {
-  // Directly send reset packet
-  uint8_t data[] = {CMD_RESET, 0x00, 0x00};
-  this->send_packet_(data, sizeof(data));
-  ESP_LOGI(TAG, "CMD: RESET (0x10)");
+  cancel_stop_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  suppress_verify_ = true; invalidate_auth_();
+  if (setup_done_) transmit_reset_();
 }
-
+bool DFRobotAI10Component::prepare_(PendingAction action) {
+  if (!setup_done_ || waiting_reset_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+    ESP_LOGW(TAG, "Module busy or booting; command rejected");
+    return false;
+  }
+  cancel_stop_(); suppress_verify_ = true; invalidate_auth_();
+  pending_cmd_ = 0; pending_action_ = action;
+  return true;
+}
 void DFRobotAI10Component::stop_recognition() {
-  ESP_LOGI(TAG, "STOP recognition requested");
-
-  // Clear local state IMMEDIATELY so HA/UI reflects "stopped" without waiting
-  // for the sensor to actually acknowledge. The sensor may still finish its
-  // current frame, but from the outside everything is already reset.
-  this->recognized_ = false;
-  this->face_detected_ = false;
-  this->last_uid_ = 0;
-  this->last_user_name_.clear();
-  this->last_type_ = TYPE_NONE;
-  this->pending_action_ = PENDING_NONE;
-  this->pending_cmd_ = 0;
-
-  // The SEN0677 accepts CMD_RESET during continuous verify and replies
-  // "success", but RESET does NOT actually abort the running verify — the
-  // IR camera keeps scanning. There is no dedicated abort command in the
-  // protocol. Workaround: override the long continuous verify with a new
-  // very-short one-shot verify (timeout=1s, continuous=false). The sensor
-  // replaces the active verify with the new one, which then self-terminates
-  // after 1 second. A final RESET afterwards returns the sensor to idle.
-  this->send_reset();
-  this->set_timeout("ai10_stop_override", 80, [this]() {
-    uint8_t data[] = {
-      CMD_VERIFY,
-      0x00, 0x02,
-      0x00,  // continuous = false
-      0x01   // timeout = 1 second
-    };
-    this->send_packet_(data, sizeof(data));
-    this->pending_cmd_ = CMD_VERIFY;
-    ESP_LOGI(TAG, "CMD: VERIFY override (stop) continuous=0 timeout=1s");
+  send_reset();
+  // Preserve the upstream firmware workaround without treating its reply as authorization.
+  set_timeout("ai10_stop_override", 80, [this]() {
+    if (!setup_done_) return;
+    uint8_t data[] = {CMD_VERIFY, 0, 2, 0, 1};
+    send_packet_(data, sizeof(data));
   });
-  this->set_timeout("ai10_stop_final", 1500, [this]() {
-    this->send_reset();
-    this->recognized_ = false;
-    this->face_detected_ = false;
-  });
+  set_timeout("ai10_stop_final", 1500, [this]() { send_reset(); });
 }
-
 void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous) {
-  if (this->pending_action_ != PENDING_NONE) return;
-  // Cancel any pending stop timers so they don't interfere with a fresh start
-  this->cancel_timeout("ai10_stop_override");
-  this->cancel_timeout("ai10_stop_final");
-  // Store intent and parameters, then trigger reset to clear previous state.
-  // The actual verify command will be sent in handle_reply_() after reset confirmation.
-  this->pending_action_ = PENDING_VERIFY;
-  this->stored_timeout_ = timeout;
-  this->stored_continuous_ = continuous;
-  this->send_reset();
+  if (!prepare_(PENDING_VERIFY)) return;
+  stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = -1;
+  transmit_reset_();
 }
-
+void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous, uint8_t max_attempts) {
+  if (!prepare_(PENDING_VERIFY)) return;
+  stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = max_attempts;
+  transmit_reset_();
+}
 void DFRobotAI10Component::enroll_user(uint8_t admin, const char *name, uint8_t timeout) {
-  if (this->pending_action_ != PENDING_NONE) return;
-  this->pending_action_ = PENDING_ENROLL;
-  this->stored_admin_ = admin;
-  this->stored_name_ = name;
-  this->stored_timeout_ = timeout;
-  this->send_reset();
+  if (!name || !prepare_(PENDING_ENROLL)) return;
+  stored_admin_ = admin; stored_name_ = name; stored_timeout_ = timeout;
+  transmit_reset_();
 }
-
 void DFRobotAI10Component::delete_user(uint16_t uid) {
-  if (this->pending_action_ != PENDING_NONE) return;
-  this->pending_action_ = PENDING_DELETE_USER;
-  this->stored_uid_ = uid;
-  this->send_reset();
+  if (!prepare_(PENDING_DELETE_USER)) return;
+  stored_uid_ = uid; transmit_reset_();
 }
-
 void DFRobotAI10Component::delete_all_users() {
-  if (this->pending_action_ != PENDING_NONE) return;
-  this->pending_action_ = PENDING_DELETE_ALL;
-  this->send_reset();
+  if (!prepare_(PENDING_DELETE_ALL)) return;
+  transmit_reset_();
 }
-
 void DFRobotAI10Component::get_all_user_ids() {
-  if (this->pending_action_ != PENDING_NONE) return;
-  this->pending_action_ = PENDING_GET_USERS;
-  this->send_reset();
+  if (!prepare_(PENDING_GET_USERS)) return;
+  user_ids_.clear(); user_count_ = 0; user_list_complete_ = false; transmit_reset_();
 }
-
 void DFRobotAI10Component::scan_qr_code(uint8_t timeout) {
-  if (this->pending_action_ != PENDING_NONE) return;
-  this->pending_action_ = PENDING_SCAN_QR;
-  this->stored_timeout_ = timeout;
-  this->send_reset();
+  if (!prepare_(PENDING_SCAN_QR)) return;
+  stored_timeout_ = timeout; transmit_reset_();
+}
+void DFRobotAI10Component::queue_extended_(uint8_t cmd, std::vector<uint8_t> data, uint32_t timeout_ms) {
+  if (!prepare_(PENDING_EXTENDED)) return;
+  extended_cmd_ = cmd; extended_data_ = std::move(data); extended_timeout_ms_ = timeout_ms;
+  transmit_reset_();
+}
+void DFRobotAI10Component::query_status() { queue_extended_(CMD_STATUS, {}); }
+void DFRobotAI10Component::query_version() { queue_extended_(CMD_VERSION, {}); }
+void DFRobotAI10Component::query_serial() { queue_extended_(CMD_SERIAL, {}); }
+void DFRobotAI10Component::query_user(uint16_t uid) {
+  stored_uid_ = uid;
+  queue_extended_(CMD_GET_USER_INFO, {uint8_t(uid >> 8), uint8_t(uid)});
+}
+void DFRobotAI10Component::clear_enrollment() { queue_extended_(CMD_FACE_RESET, {}); }
+void DFRobotAI10Component::enroll_direction(uint8_t admin, const char *name, uint8_t direction, uint8_t timeout) {
+  if (!name || admin > 1 || direction > 31) return;
+  std::vector<uint8_t> data(35, 0); data[0] = admin;
+  memcpy(data.data()+1, name, std::min<size_t>(strlen(name), 31));
+  data[33] = direction; data[34] = timeout;
+  queue_extended_(CMD_ENROLL_DIRECTION, std::move(data), uint32_t(timeout)*1000+3000);
+}
+void DFRobotAI10Component::enroll_interactive(uint8_t admin, const char *name, uint8_t type, uint8_t duplicate, uint8_t timeout) {
+  if (!name || admin > 1 || duplicate > 2) return;
+  std::vector<uint8_t> data(40, 0); data[0] = admin;
+  memcpy(data.data()+1, name, std::min<size_t>(strlen(name), 31));
+  data[34] = type; data[35] = duplicate; data[36] = timeout;
+  queue_extended_(CMD_ENROLL_INTERACTIVE, std::move(data), uint32_t(timeout)*1000+3000);
+}
+void DFRobotAI10Component::query_uvc() { queue_extended_(CMD_UVC_READ, {}); }
+void DFRobotAI10Component::configure_uvc(uint8_t usb, uint8_t bitrate, uint8_t quality, uint8_t attributes) {
+  if ((usb != 0x11 && usb != 0x20 && usb != 0x91 && usb != 0xA0) || quality < 10 || quality > 100 || attributes > 3) return;
+  queue_extended_(CMD_UVC_WRITE, {usb, bitrate, quality, attributes});
 }
 
 // ===== Internal Helper: Execute Pending Action =====
@@ -198,15 +225,15 @@ void DFRobotAI10Component::scan_qr_code(uint8_t timeout) {
 void DFRobotAI10Component::execute_pending_action_() {
   if (this->pending_action_ == PENDING_NONE) return;
 
+  command_started_ = millis();
+  command_timeout_ms_ = 3000;
   switch (this->pending_action_) {
     case PENDING_VERIFY: {
-      uint8_t data[] = {
-        CMD_VERIFY,
-        0x00, 0x02,
-        (uint8_t)(this->stored_continuous_ ? 0x01 : 0x00),
-        this->stored_timeout_
-      };
-      this->send_packet_(data, sizeof(data));
+      uint8_t data[] = {CMD_VERIFY, 0, uint8_t(max_attempts_ < 0 ? 2 : 3),
+        uint8_t(stored_continuous_ ? 1 : 0), stored_timeout_, uint8_t(max_attempts_)};
+      suppress_verify_ = false;
+      command_timeout_ms_ = stored_continuous_ ? 0x7FFFFFFFUL : uint32_t(stored_timeout_)*1000+3000;
+      send_packet_(data, max_attempts_ < 0 ? 5 : 6);
       this->pending_cmd_ = CMD_VERIFY;
       this->recognized_ = false; // Reset auth state on new verify start
       ESP_LOGI(TAG, "CMD: VERIFY (0x12) continuous=%d timeout=%ds", this->stored_continuous_, this->stored_timeout_);
@@ -214,8 +241,8 @@ void DFRobotAI10Component::execute_pending_action_() {
     }
 
     case PENDING_ENROLL: {
-      ESP_LOGI(TAG, "CMD: ENROLL '%s' admin=%d timeout=%ds", 
-               this->stored_name_.c_str(), this->stored_admin_, this->stored_timeout_);
+      command_timeout_ms_ = uint32_t(stored_timeout_)*1000+3000;
+      ESP_LOGI(TAG, "CMD: ENROLL timeout=%ds", stored_timeout_);
       
       EnrollData ed;
       memset(&ed, 0, sizeof(ed));
@@ -267,13 +294,23 @@ void DFRobotAI10Component::execute_pending_action_() {
     }
 
     case PENDING_SCAN_QR: {
-      uint8_t data[] = {CMD_SCAN_QR_CODE, 0x00, 0x01, this->stored_timeout_};
-      this->send_packet_(data, sizeof(data));
+      command_timeout_ms_ = uint32_t(stored_timeout_)*1000+3000;
+      uint8_t data[] = {CMD_SCAN_QR_CODE, 0, 2, 0, stored_timeout_};
+      uint8_t legacy[] = {CMD_SCAN_QR_CODE, 0, 1, stored_timeout_};
+      if (documented_qr_) send_packet_(data, sizeof(data));
+      else send_packet_(legacy, sizeof(legacy));
       this->pending_cmd_ = CMD_SCAN_QR_CODE;
       ESP_LOGI(TAG, "CMD: SCAN QR CODE timeout=%ds", this->stored_timeout_);
       break;
     }
     
+    case PENDING_EXTENDED: {
+      std::vector<uint8_t> packet{extended_cmd_, uint8_t(extended_data_.size() >> 8), uint8_t(extended_data_.size())};
+      packet.insert(packet.end(), extended_data_.begin(), extended_data_.end());
+      pending_cmd_ = extended_cmd_; command_timeout_ms_ = extended_timeout_ms_;
+      send_packet_(packet.data(), packet.size());
+      break;
+    }
     default:
       break;
   }
@@ -292,7 +329,7 @@ void DFRobotAI10Component::send_packet_(const uint8_t *data, size_t len) {
   this->write_array(sync, 2);
   this->write_array(data, len);
   this->write_byte(xor_check);
-  this->flush();
+  // UART driver buffers outgoing bytes; avoid a blocking flush here.
 
   // Debug log (hex string construction omitted for brevity/performance in standard log level)
   if (len <= 8) {
@@ -320,7 +357,7 @@ void DFRobotAI10Component::process_packet_(uint8_t msg_id, const uint8_t *payloa
     this->handle_note_(payload, len);
   } else {
     ESP_LOGW(TAG, "Unknown MsgID: 0x%02X", msg_id);
-    this->log_hex_("  Data: ", payload, len);
+    // Do not log unsolicited payloads.
   }
 }
 
@@ -330,116 +367,111 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     return;
   }
 
-  // Reply format: [cmd_echo][result][data...]
-  uint8_t cmd_echo = payload[0];
-  uint8_t result = payload[1];
-  this->last_result_ = result;
-
-  ESP_LOGI(TAG, "REPLY: cmd=0x%02X result=%d (%s)", cmd_echo, result, result_to_str_(result));
-
-  // Security Check: Invalidate auth state on failure (e.g. liveness check failed)
-  if (result != RES_SUCCESS) {
-    ESP_LOGW(TAG, "  Command failed: %s", result_to_str_(result));
-    
-    if (cmd_echo == CMD_VERIFY) {
-       this->recognized_ = false;
-       this->last_uid_ = 0;
-       this->last_user_name_ = "";
-       this->last_type_ = TYPE_NONE;
-    }
-    
-    // Clear pending action if Reset failed, to prevent stuck state
-    if (cmd_echo == CMD_RESET) {
-        this->pending_action_ = PENDING_NONE;
-    }
-    
+  uint8_t cmd = payload[0], result = payload[1];
+  const uint8_t *data = payload + 2;
+  uint16_t n = len - 2;
+  if (cmd == CMD_RESET) {
+    if (!waiting_reset_) return;
+    if (result != RES_SUCCESS) { fail_command_(cmd, result); return; }
+    waiting_reset_ = false; last_result_ = result;
+    execute_pending_action_();
     return;
   }
-
-  // Process successful response data
-  const uint8_t *data = payload + 2;
-  uint16_t data_len = len - 2;
-
-  switch (cmd_echo) {
-    case CMD_RESET:
-      ESP_LOGD(TAG, "  Reset successful. Executing pending actions...");
-      this->execute_pending_action_();
-      break;
-
+  if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && suppress_verify_)) return;
+  bool continuous = cmd == CMD_VERIFY && stored_continuous_;
+  if (result != RES_SUCCESS) {
+    if (continuous) {
+      invalidate_auth_(); last_result_ = result;
+      recognition_failed_.call(result); command_result_.call(cmd, result);
+    } else fail_command_(cmd, result);
+    return;
+  }
+  auto uid_of = [](const uint8_t *p) -> uint16_t { return uint16_t(p[0]) << 8 | p[1]; };
+  auto valid_uid = [](uint16_t uid) { return uid >= 1 && uid <= 2000; };
+  auto bounded_string = [](const uint8_t *p, size_t size) {
+    size_t length = 0; while (length < size && p[length]) ++length;
+    return std::string(reinterpret_cast<const char *>(p), length);
+  };
+  bool valid = true;
+  bool more = continuous;
+  switch (cmd) {
     case CMD_VERIFY:
-      // Response: UID(2) + userName(32) + admin(1) = 35 bytes
-      if (data_len >= 35) {
-        uint16_t uid = (data[0] << 8) | data[1];
-        char name[33] = {0};
-        memcpy(name, &data[2], 32);
-        name[32] = '\0';
-        uint8_t admin = data[34];
-
-        this->last_uid_ = uid;
-        this->last_user_name_ = name;
-        this->last_type_ = (uid > 1000) ? TYPE_PALM : TYPE_FACE;
-        this->recognized_ = true;
-
-        ESP_LOGI(TAG, "  RECOGNIZED: uid=%d name='%s' admin=%d type=%s",
-                 uid, name, admin,
-                 this->last_type_ == TYPE_FACE ? "face" : "palm");
-        
-        // Trigger event in ESPHome
-        this->on_recognized_callback_.call(this->last_user_name_, this->last_uid_);
+      valid = n >= 35 && valid_uid(uid_of(data)) && data[34] <= 1;
+      if (valid) {
+        last_uid_ = uid_of(data); last_user_name_ = bounded_string(data+2,32);
+        last_admin_ = data[34] != 0; last_type_ = last_uid_ > 1000 ? TYPE_PALM : TYPE_FACE;
+        recognized_ = true; last_result_ = result;
       }
       break;
-
     case CMD_SCAN_QR_CODE:
-      if (data_len > 0) {
-        this->last_qr_data_ = std::string((char *)data, data_len);
-        this->last_type_ = TYPE_QR;
-        this->recognized_ = true;
-        
-        ESP_LOGI(TAG, "  QR CODE: '%s'", this->last_qr_data_.c_str());
-        
-        // Trigger QR event in ESPHome
-        this->on_qr_scanned_callback_.call(this->last_qr_data_);
-      }
+      valid = n > 0;
+      if (valid) { last_qr_data_.assign(reinterpret_cast<const char *>(data),n); last_type_ = TYPE_QR; }
       break;
-
     case CMD_ENROLL_SINGLE:
-      if (data_len >= 2) {
-        uint16_t uid = (data[0] << 8) | data[1];
-        this->last_uid_ = uid;
-        ESP_LOGI(TAG, "  Enrollment successful! uid=%d", uid);
-      }
+    case CMD_ENROLL_DIRECTION:
+    case CMD_ENROLL_INTERACTIVE:
+      valid = n >= 2 && valid_uid(uid_of(data));
+      if (valid) { last_uid_ = uid_of(data); user_list_complete_ = false; }
       break;
-
     case CMD_DEL_USER:
-      ESP_LOGI(TAG, "  User deleted");
-      break;
-
     case CMD_DEL_ALL_USER:
-      ESP_LOGI(TAG, "  All users deleted");
-      this->user_count_ = 0;
+      user_list_complete_ = false;
+      user_ids_.clear(); user_count_ = 0;
       break;
-
     case CMD_GET_ALL_USERID:
-      if (data_len >= 1) {
-        uint8_t user_count = data[0];
-        this->user_count_ = user_count;
-        ESP_LOGI(TAG, "  Registered users: %d", user_count);
-        for (uint8_t i = 0; i < user_count && (1 + i * 2 + 1) < data_len; i++) {
-          uint16_t uid = (data[1 + i * 2] << 8) | data[2 + i * 2];
-          ESP_LOGI(TAG, "    UID[%d] = %d", i, uid);
+      valid = n >= 1 && data[0] <= 100 && n == 1 + 2 * data[0];
+      if (valid) {
+        for (size_t i = 0; i < data[0]; i++) {
+          uint16_t uid = uid_of(data + 1 + 2*i);
+          if (!valid_uid(uid) || std::find(user_ids_.begin(), user_ids_.end(), uid) != user_ids_.end()) {
+            valid = false; break;
+          }
+          user_ids_.push_back(uid);
+        }
+        if (valid) {
+          user_count_ = user_ids_.size(); more = data[0] == 100;
+          user_list_complete_ = !more;
+          command_started_ = millis();
         }
       }
+      if (!valid) { user_ids_.clear(); user_count_ = 0; }
       break;
-
-    default:
-      ESP_LOGD(TAG, "  Unhandled reply for cmd 0x%02X", cmd_echo);
-      this->log_hex_("  Data: ", data, data_len);
+    case CMD_GET_USER_INFO:
+      valid = n == 35 && valid_uid(uid_of(data)) && data[34] <= 1 &&
+        extended_data_.size() == 2 && uid_of(data) == uid_of(extended_data_.data());
       break;
+    case CMD_STATUS:
+      valid = n == 1 && data[0] <= 3;
+      if (valid) module_status_ = data[0];
+      break;
+    case CMD_VERSION:
+      valid = n > 0;
+      if (valid) firmware_version_ = bounded_string(data,n);
+      break;
+    case CMD_SERIAL:
+      valid = n >= 8;
+      if (valid) serial_number_ = bounded_string(data,8);
+      break;
+    case CMD_UVC_READ:
+      valid = n == 4;
+      if (valid) ESP_LOGI(TAG, "UVC: USB=0x%02X bitrate=%u quality=%u attributes=0x%02X",data[0],data[1],data[2],data[3]);
+      break;
+    default: break;
   }
+  if (!valid) { fail_command_(cmd, RES_FAILED_INVALID_PARAM); return; }
+  last_result_ = result;
+  if (!more) pending_cmd_ = 0;
+  if (cmd == CMD_VERIFY) on_recognized_callback_.call(last_user_name_,last_uid_);
+  else if (cmd == CMD_SCAN_QR_CODE) on_qr_scanned_callback_.call(last_qr_data_);
+  else if (enrollment_command_(cmd)) enrollment_success_.call(last_uid_);
+  else if (cmd == CMD_GET_USER_INFO) user_info_.call(uid_of(data),bounded_string(data+2,32),data[34]!=0);
+  else if (cmd == CMD_GET_ALL_USERID && !more) users_received_.call(user_count_);
+  if (cmd != CMD_GET_ALL_USERID || !more) command_result_.call(cmd,result);
 }
 
 void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {
   // Full note (sNoteData_t): nid(1) + state(2) + left(2) + top(2) + right(2) + bottom(2) + yaw(2) + pitch(2) + roll(2) = 17 bytes
+  if (suppress_verify_ || waiting_reset_) return;
   if (len >= 17) {
     uint8_t nid = payload[0];
     int16_t state = (payload[1] << 8) | payload[2];
