@@ -145,7 +145,9 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   // Explicit opt-in, streaming to caller-owned storage; never expose biometric bytes to HA logs.
   using ChunkSink = std::function<bool(const uint8_t *, size_t)>;
   void set_allow_sensitive_transfers(bool value) { allow_sensitive_transfers_ = value; }
-  void capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink);
+  bool capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink);
+  bool can_capture_snapshot() const { return setup_done_ && !is_busy() && !stop_in_progress_ && !refresh_queued_; }
+  bool is_image_transfer_active() const { return bool(transfer_sink_); }
   void export_template(uint16_t uid, uint8_t type, ChunkSink sink);
   void import_template(uint8_t type, const std::string &name, std::vector<uint8_t> bytes);
   void enroll_photo(uint8_t bio_type, const std::string &name, std::vector<uint8_t> bytes);
@@ -239,7 +241,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   std::vector<uint8_t> extended_data_;
   uint32_t extended_timeout_ms_{3000};
   uint32_t command_started_{0}, command_timeout_ms_{3000}, last_byte_{0};
-  bool waiting_reset_{false}, suppress_verify_{true};
+  bool waiting_reset_{false}, suppress_verify_{true}, stop_in_progress_{false};
   int16_t max_attempts_{-1};
   CallbackManager<void(uint16_t)> enrollment_success_, users_received_;
   CallbackManager<void(uint8_t)> enrollment_failed_, recognition_failed_;

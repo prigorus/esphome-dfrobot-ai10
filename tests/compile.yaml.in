@@ -19,6 +19,7 @@ dfrobot_ai10:
   id: ai10_sensor
   uart_id: uart_ai10
   documented_qr: true
+  allow_sensitive_transfers: true
   auto_refresh_users: true
   resume_recognition_after_refresh: true
   on_user_directory:
@@ -51,3 +52,18 @@ dfrobot_ai10:
   on_users_received:
     then:
       - lambda: 'ESP_LOGI("ci", "count=%u", count);'
+
+dfrobot_ai10_camera:
+  id: ai10_camera
+  name: "AI10 snapshot"
+  ai10_id: ai10_sensor
+  max_image_bytes: 49152
+button:
+  - platform: template
+    name: "Capture"
+    on_press:
+      - lambda: id(ai10_camera)->take_snapshot();
+api:
+wifi:
+  ssid: "CI-test-only"
+  password: "not-a-real-password"

@@ -121,6 +121,7 @@ void DFRobotAI10Component::invalidate_auth_() {
 void DFRobotAI10Component::cancel_stop_() {
   cancel_timeout("ai10_stop_override");
   cancel_timeout("ai10_stop_final");
+  stop_in_progress_ = false;
 }
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   bool failed_directory = directory_active_;
@@ -161,6 +162,7 @@ bool DFRobotAI10Component::prepare_(PendingAction action) {
 }
 void DFRobotAI10Component::stop_recognition() {
   send_reset();
+  stop_in_progress_ = true;
   // Preserve the upstream firmware workaround without treating its reply as authorization.
   set_timeout("ai10_stop_override", 80, [this]() {
     if (!setup_done_) return;
@@ -319,12 +321,13 @@ void DFRobotAI10Component::send_extended_packet_(uint8_t cmd, const std::vector<
   packet.insert(packet.end(),data.begin(),data.end());
   send_packet_(packet.data(),packet.size());
 }
-void DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink) {
-  if (!allow_sensitive_transfers_ || !sink || (kind != 0x71 && kind != 0x72 && kind != 0x74) || resolution > 2 || !prepare_(PENDING_EXTENDED)) return;
+bool DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink) {
+  if (!allow_sensitive_transfers_ || !sink || (kind != 0x71 && kind != 0x72 && kind != 0x74) || resolution > 2 || !prepare_(PENDING_EXTENDED)) return false;
   transfer_sink_ = std::move(sink); transfer_size_ = transfer_received_ = 0; transfer_seq_ = 0; capture_uid_ = 0;
   extended_cmd_ = kind; extended_data_ = {0};
   if (kind == 0x74) extended_data_.push_back(resolution);
   extended_timeout_ms_ = 30000; transmit_reset_();
+  return true;
 }
 void DFRobotAI10Component::export_template(uint16_t uid, uint8_t type, ChunkSink sink) {
   if (!allow_sensitive_transfers_ || !sink || uid < 1 || uid > 2000 || type < 1 || type > 3 || !prepare_(PENDING_EXTENDED)) return;

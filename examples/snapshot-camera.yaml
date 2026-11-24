@@ -1,0 +1,47 @@
+# Merge into existing YAML. Include BOTH external components.
+external_components:
+  - source:
+      type: git
+      url: https://github.com/prigorus/esphome-dfrobot-ai10
+      ref: develop
+    components: [dfrobot_ai10, dfrobot_ai10_camera]
+    refresh: 0s
+
+# Keep existing UART pins, baud rate 115200 and rx_buffer_size >= 2048.
+dfrobot_ai10:
+  id: ai10_sensor
+  uart_id: uart_ai10
+  allow_sensitive_transfers: true
+
+dfrobot_ai10_camera:
+  id: ai10_camera
+  name: "AI10 Last Snapshot"
+  ai10_id: ai10_sensor
+  max_image_bytes: 49152
+
+button:
+  - platform: template
+    name: "AI10 Capture Snapshot"
+    on_press:
+      - lambda: id(ai10_camera)->take_snapshot();
+  - platform: template
+    name: "AI10 Stop Recognition"
+    on_press:
+      - lambda: id(ai10_sensor)->stop_recognition();
+  - platform: template
+    name: "AI10 Start Recognition"
+    on_press:
+      - lambda: id(ai10_sensor)->start_recognition(30, true);
+
+text_sensor:
+  - platform: template
+    name: "AI10 Snapshot Status"
+    lambda: return id(ai10_camera)->get_capture_status();
+    update_interval: 1s
+sensor:
+  - platform: template
+    name: "AI10 Snapshot Size"
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    lambda: return id(ai10_camera)->get_image_size();
+    update_interval: 1s
