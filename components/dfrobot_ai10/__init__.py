@@ -32,10 +32,17 @@ CommandResultTrigger = dfrobot_ai10_ns.class_("CommandResultTrigger", automation
 UserInfoTrigger = dfrobot_ai10_ns.class_("UserInfoTrigger", automation.Trigger.template(cg.uint16,cg.std_string,cg.bool_))
 UsersReceivedTrigger = dfrobot_ai10_ns.class_("UsersReceivedTrigger", automation.Trigger.template(cg.uint16))
 
+UserDirectoryTrigger = dfrobot_ai10_ns.class_("UserDirectoryTrigger", automation.Trigger.template(cg.uint16))
+UserDirectoryFailedTrigger = dfrobot_ai10_ns.class_("UserDirectoryFailedTrigger", automation.Trigger.template(cg.uint8))
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(DFRobotAI10Component),
         cv.Optional("documented_qr", default=False): cv.boolean,
+        cv.Optional("auto_refresh_users", default=False): cv.boolean,
+        cv.Optional("resume_recognition_after_refresh", default=False): cv.boolean,
+        cv.Optional("on_user_directory"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(UserDirectoryTrigger)}),
+        cv.Optional("on_user_directory_failed"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(UserDirectoryFailedTrigger)}),
         cv.Optional("allow_sensitive_transfers", default=False): cv.boolean,
         cv.Optional("on_enrollment_success"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EnrollmentSuccessTrigger)}),
         cv.Optional("on_enrollment_failed"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EnrollmentFailedTrigger)}),
@@ -66,6 +73,8 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     cg.add(var.set_documented_qr(config['documented_qr']))
+    cg.add(var.set_auto_refresh_users(config['auto_refresh_users']))
+    cg.add(var.set_resume_recognition_after_refresh(config['resume_recognition_after_refresh']))
     cg.add(var.set_allow_sensitive_transfers(config['allow_sensitive_transfers']))
 
     for conf in config.get(CONF_ON_RECOGNIZED, []):
@@ -97,3 +106,10 @@ async def to_code(config):
     for conf in config.get("on_users_received", []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [(cg.uint16, "count")], conf)
+
+    for conf in config.get("on_user_directory", []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [(cg.uint16, "count")], conf)
+    for conf in config.get("on_user_directory_failed", []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [(cg.uint8, "result")], conf)

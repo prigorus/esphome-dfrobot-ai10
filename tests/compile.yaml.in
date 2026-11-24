@@ -19,6 +19,14 @@ dfrobot_ai10:
   id: ai10_sensor
   uart_id: uart_ai10
   documented_qr: true
+  auto_refresh_users: true
+  resume_recognition_after_refresh: true
+  on_user_directory:
+    then:
+      - lambda: 'ESP_LOGI("ci", "directory count=%u", count);'
+  on_user_directory_failed:
+    then:
+      - lambda: 'ESP_LOGI("ci", "directory failed=%u", result);'
   on_recognized:
     then:
       - lambda: 'ESP_LOGI("ci", "uid=%u", uid);'

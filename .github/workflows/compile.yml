@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 jobs:
+  user-parser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: g++ -std=c++17 -Wall -Wextra -Werror -I components/dfrobot_ai10 tests/test_users.cpp -o /tmp/ai10-test-users
+      - run: /tmp/ai10-test-users
   compile:
     runs-on: ubuntu-latest
     strategy:

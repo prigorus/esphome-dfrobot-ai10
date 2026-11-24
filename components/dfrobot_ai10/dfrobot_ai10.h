@@ -17,6 +17,7 @@
 #include <cstring>
 #include <algorithm>
 #include <functional>
+#include "ai10_users.h"
 
 namespace esphome {
 namespace dfrobot_ai10 {
@@ -120,6 +121,15 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void delete_user(uint16_t uid);
   void delete_all_users();
   void get_all_user_ids();
+  void refresh_users();
+  void set_auto_refresh_users(bool value) { auto_refresh_users_ = value; }
+  void set_resume_recognition_after_refresh(bool value) { resume_recognition_after_refresh_ = value; }
+  const std::vector<UserRecord> &get_users() const { return users_; }
+  bool is_user_directory_complete() const { return directory_complete_; }
+  std::string get_user_summary() const;
+  const std::vector<uint8_t> &get_serial_raw() const { return serial_raw_; }
+  void add_on_user_directory_callback(std::function<void(uint16_t)> &&cb) { user_directory_.add(std::move(cb)); }
+  void add_on_user_directory_failed_callback(std::function<void(uint8_t)> &&cb) { user_directory_failed_.add(std::move(cb)); }
   void scan_qr_code(uint8_t timeout);
   void send_reset();
   void stop_recognition();
@@ -205,6 +215,22 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   uint16_t user_count_{0};
   std::vector<uint16_t> user_ids_;
   bool user_list_complete_{false};
+  std::vector<UserRecord> users_, staged_users_;
+  std::vector<uint8_t> serial_raw_;
+  bool directory_complete_{false}, directory_active_{false}, refresh_queued_{false};
+  bool auto_refresh_users_{false}, resume_recognition_after_refresh_{false};
+  bool resume_pending_{false};
+  uint8_t resume_timeout_{0};
+  int16_t resume_attempts_{-1};
+  size_t directory_index_{0};
+  CallbackManager<void(uint16_t)> user_directory_;
+  CallbackManager<void(uint8_t)> user_directory_failed_;
+  void remember_recognition_();
+  void invalidate_directory_();
+  void schedule_directory_refresh_();
+  void request_next_user_();
+  void finish_directory_();
+  void cancel_directory_();
   bool last_admin_{false};
   bool documented_qr_{false};
   uint8_t module_status_{0xFF};
@@ -311,6 +337,19 @@ class UsersReceivedTrigger : public Trigger<uint16_t> {
  public:
   explicit UsersReceivedTrigger(DFRobotAI10Component *parent) {
     parent->add_on_users_received_callback([this](uint16_t count) { this->trigger(count); });
+  }
+};
+
+class UserDirectoryTrigger : public Trigger<uint16_t> {
+ public:
+  explicit UserDirectoryTrigger(DFRobotAI10Component *parent) {
+    parent->add_on_user_directory_callback([this](uint16_t count) { this->trigger(count); });
+  }
+};
+class UserDirectoryFailedTrigger : public Trigger<uint8_t> {
+ public:
+  explicit UserDirectoryFailedTrigger(DFRobotAI10Component *parent) {
+    parent->add_on_user_directory_failed_callback([this](uint8_t result) { this->trigger(result); });
   }
 };
 

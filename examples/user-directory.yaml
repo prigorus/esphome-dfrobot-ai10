@@ -1,0 +1,45 @@
+# Merge these sections into an existing configuration; do not duplicate YAML keys.
+# User names are personal data. Expose this summary only to trusted HA users.
+dfrobot_ai10:
+  id: ai10_sensor
+  uart_id: uart_ai10
+  auto_refresh_users: true
+  resume_recognition_after_refresh: false
+  on_user_directory:
+    then:
+      - text_sensor.template.publish:
+          id: ai10_users
+          state: !lambda 'return id(ai10_sensor)->get_user_summary();'
+      - sensor.template.publish:
+          id: ai10_directory_count
+          state: !lambda 'return count;'
+      - binary_sensor.template.publish:
+          id: ai10_directory_complete
+          state: true
+  on_user_directory_failed:
+    then:
+      - text_sensor.template.publish:
+          id: ai10_users
+          state: "Refresh failed"
+      - binary_sensor.template.publish:
+          id: ai10_directory_complete
+          state: false
+button:
+  - platform: template
+    name: "Refresh AI10 users"
+    on_press:
+      - lambda: id(ai10_sensor)->refresh_users();
+text_sensor:
+  - platform: template
+    name: "AI10 users"
+    id: ai10_users
+sensor:
+  - platform: template
+    name: "AI10 user directory count"
+    id: ai10_directory_count
+    accuracy_decimals: 0
+binary_sensor:
+  - platform: template
+    name: "AI10 user directory complete"
+    id: ai10_directory_complete
+    lambda: return id(ai10_sensor)->is_user_directory_complete();

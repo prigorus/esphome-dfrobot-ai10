@@ -97,6 +97,10 @@ void DFRobotAI10Component::loop() {
     uint8_t cmd = waiting_reset_ ? CMD_RESET : pending_cmd_;
     fail_command_(cmd, RES_FAILED_TIMEOUT);
   }
+  if (refresh_queued_ && setup_done_ && !waiting_reset_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
+    refresh_queued_ = false;
+    refresh_users();
+  }
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
     this->last_status_log_ = now;
     ESP_LOGD(TAG, "Parser state: %s, last result: %s",
@@ -119,6 +123,8 @@ void DFRobotAI10Component::cancel_stop_() {
   cancel_timeout("ai10_stop_final");
 }
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
+  bool failed_directory = directory_active_;
+  cancel_directory_();
   bool enroll = enrollment_command_(cmd) || (cmd == CMD_RESET && (pending_action_ == PENDING_ENROLL || (pending_action_ == PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
   bool verify = cmd == CMD_VERIFY || (cmd == CMD_RESET && pending_action_ == PENDING_VERIFY);
   waiting_reset_ = false; pending_action_ = PENDING_NONE; pending_cmd_ = 0;
@@ -126,6 +132,7 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   suppress_verify_ = true; invalidate_auth_(); last_result_ = result;
   if (enroll) enrollment_failed_.call(result);
   if (verify) recognition_failed_.call(result);
+  if (failed_directory) user_directory_failed_.call(result);
   command_result_.call(cmd, result);
 }
 void DFRobotAI10Component::transmit_reset_() {
@@ -134,7 +141,7 @@ void DFRobotAI10Component::transmit_reset_() {
   send_packet_(data, sizeof(data));
 }
 void DFRobotAI10Component::send_reset() {
-  cancel_stop_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  cancel_stop_(); cancel_directory_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
   clear_transfer_();
   suppress_verify_ = true; invalidate_auth_();
   if (setup_done_) transmit_reset_();
@@ -144,6 +151,10 @@ bool DFRobotAI10Component::prepare_(PendingAction action) {
     ESP_LOGW(TAG, "Module busy or booting; command rejected");
     return false;
   }
+  if (action == PENDING_ENROLL || action == PENDING_DELETE_USER || action == PENDING_DELETE_ALL ||
+      (action == PENDING_EXTENDED && auto_refresh_users_))
+    remember_recognition_();
+  else if (!directory_active_) resume_pending_ = false;
   cancel_stop_(); suppress_verify_ = true; invalidate_auth_();
   pending_cmd_ = 0; pending_action_ = action;
   return true;
@@ -181,9 +192,83 @@ void DFRobotAI10Component::delete_all_users() {
   if (!prepare_(PENDING_DELETE_ALL)) return;
   transmit_reset_();
 }
+void DFRobotAI10Component::remember_recognition_() {
+  if (resume_recognition_after_refresh_ && pending_cmd_ == CMD_VERIFY && stored_continuous_ && !suppress_verify_) {
+    resume_pending_ = true;
+    resume_timeout_ = stored_timeout_;
+    resume_attempts_ = max_attempts_;
+  }
+}
+void DFRobotAI10Component::invalidate_directory_() {
+  directory_complete_ = false;
+  users_.clear();
+}
+void DFRobotAI10Component::cancel_directory_() {
+  if (directory_active_) {
+    invalidate_directory_();
+    user_list_complete_ = false; user_ids_.clear(); user_count_ = 0;
+  }
+  directory_active_ = false;
+  refresh_queued_ = false;
+  resume_pending_ = false;
+  staged_users_.clear();
+}
+void DFRobotAI10Component::schedule_directory_refresh_() {
+  invalidate_directory_();
+  if (auto_refresh_users_) refresh_queued_ = true;
+  else resume_pending_ = false;
+}
+void DFRobotAI10Component::refresh_users() {
+  // Keep one outstanding request; never overlap user-detail replies.
+  if (!setup_done_ || waiting_reset_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+    ESP_LOGW(TAG, "User directory refresh rejected: module busy or booting");
+    return;
+  }
+  remember_recognition_();
+  directory_active_ = true;
+  if (!prepare_(PENDING_GET_USERS)) { cancel_directory_(); return; }
+  refresh_queued_ = false; directory_index_ = 0;
+  invalidate_directory_(); staged_users_.clear();
+  user_ids_.clear(); user_count_ = 0; user_list_complete_ = false;
+  transmit_reset_();
+}
+void DFRobotAI10Component::request_next_user_() {
+  if (directory_index_ >= user_ids_.size()) { finish_directory_(); return; }
+  uint16_t uid = user_ids_[directory_index_];
+  extended_data_ = {uint8_t(uid >> 8), uint8_t(uid)};
+  pending_cmd_ = CMD_GET_USER_INFO;
+  command_started_ = millis(); command_timeout_ms_ = 3000;
+  send_extended_packet_(pending_cmd_,extended_data_);
+}
+void DFRobotAI10Component::finish_directory_() {
+  users_.swap(staged_users_); staged_users_.clear();
+  directory_complete_ = true; directory_active_ = false; pending_cmd_ = 0;
+  bool resume = resume_pending_; resume_pending_ = false;
+  uint8_t timeout = resume_timeout_;
+  int16_t attempts = resume_attempts_;
+  // Resume only after successful refresh; authorization remains cleared.
+  if (resume) {
+    if (attempts < 0) start_recognition(timeout,true);
+    else start_recognition(timeout,true,uint8_t(attempts));
+  }
+  user_directory_.call(uint16_t(users_.size()));
+}
+std::string DFRobotAI10Component::get_user_summary() const {
+  if (!directory_complete_) return {};
+  // ESPHome text sensors have a short state limit. Use per-user events for large directories.
+  std::string out;
+  for (const auto &u : users_) {
+    std::string row = std::to_string(u.uid) + ": " + u.name +
+        (u.is_palm() ? " [palm]" : " [face]") + (u.admin ? " [admin]" : "");
+    if (out.size()+row.size()+2 > 240) { out += "..."; break; }
+    if (!out.empty()) out += "; ";
+    out += row;
+  }
+  return out;
+}
 void DFRobotAI10Component::get_all_user_ids() {
   if (!prepare_(PENDING_GET_USERS)) return;
-  user_ids_.clear(); user_count_ = 0; user_list_complete_ = false; transmit_reset_();
+  invalidate_directory_(); user_ids_.clear(); user_count_ = 0; user_list_complete_ = false; transmit_reset_();
 }
 void DFRobotAI10Component::scan_qr_code(uint8_t timeout) {
   if (!prepare_(PENDING_SCAN_QR)) return;
@@ -465,6 +550,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     if (transfer_received_==transfer_size_) {
       if (!uid || uid>2000) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
       pending_cmd_=0; clear_transfer_(); last_uid_=uid; user_list_complete_=false; last_result_=result;
+      schedule_directory_refresh_();
       enrollment_success_.call(uid); command_result_.call(cmd,result);
     } else {
       if (uid) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
@@ -488,6 +574,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   };
   bool valid = true;
   bool more = continuous;
+  UserRecord user_record;
   switch (cmd) {
     case CMD_VERIFY:
       valid = n >= 35 && valid_uid(uid_of(data)) && data[34] <= 1;
@@ -505,34 +592,24 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     case CMD_ENROLL_DIRECTION:
     case CMD_ENROLL_INTERACTIVE:
       valid = n >= 2 && valid_uid(uid_of(data));
-      if (valid) { last_uid_ = uid_of(data); user_list_complete_ = false; }
+      if (valid) { last_uid_ = uid_of(data); user_list_complete_ = false; schedule_directory_refresh_(); }
       break;
     case CMD_DEL_USER:
     case CMD_DEL_ALL_USER:
       user_list_complete_ = false;
-      user_ids_.clear(); user_count_ = 0;
+      user_ids_.clear(); user_count_ = 0; schedule_directory_refresh_();
       break;
     case CMD_GET_ALL_USERID:
-      valid = n >= 1 && data[0] <= 100 && n == 1 + 2 * data[0];
+      valid = append_uid_page(data,n,user_ids_);
       if (valid) {
-        for (size_t i = 0; i < data[0]; i++) {
-          uint16_t uid = uid_of(data + 1 + 2*i);
-          if (!valid_uid(uid) || std::find(user_ids_.begin(), user_ids_.end(), uid) != user_ids_.end()) {
-            valid = false; break;
-          }
-          user_ids_.push_back(uid);
-        }
-        if (valid) {
-          user_count_ = user_ids_.size(); more = data[0] == 100;
-          user_list_complete_ = !more;
-          command_started_ = millis();
-        }
-      }
-      if (!valid) { user_ids_.clear(); user_count_ = 0; }
+        user_count_ = user_ids_.size(); more = data[0] == 100;
+        user_list_complete_ = !more;
+        command_started_ = millis();
+      } else { user_ids_.clear(); user_count_ = 0; }
       break;
     case CMD_GET_USER_INFO:
-      valid = n == 35 && valid_uid(uid_of(data)) && data[34] <= 1 &&
-        extended_data_.size() == 2 && uid_of(data) == uid_of(extended_data_.data());
+      valid = decode_user_record(data,n,user_record) &&
+        extended_data_.size() == 2 && user_record.uid == uid_of(extended_data_.data());
       break;
     case CMD_STATUS:
       valid = n == 1 && data[0] <= 3;
@@ -544,7 +621,10 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       break;
     case CMD_SERIAL:
       valid = n >= 8;
-      if (valid) serial_number_ = bounded_string(data,8);
+      if (valid) {
+        serial_raw_.assign(data,data+n);
+        serial_number_ = display_serial(data,n);
+      }
       break;
     case CMD_UVC_READ:
       valid = n == 4;
@@ -555,10 +635,28 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (!valid) { fail_command_(cmd, RES_FAILED_INVALID_PARAM); return; }
   last_result_ = result;
   if (!more) pending_cmd_ = 0;
+  if (directory_active_ && cmd == CMD_GET_ALL_USERID && !more) {
+    // Keep the directory operation active across individual requests.
+    request_next_user_();
+    users_received_.call(user_count_);
+    command_result_.call(cmd,result);
+    return;
+  }
+  if (directory_active_ && cmd == CMD_GET_USER_INFO) {
+    staged_users_.push_back(user_record);
+    ++directory_index_;
+    // Emit the record before completion, so event consumers can assemble a full list.
+    // Keep busy through callbacks and honor explicit cancellation.
+    pending_cmd_ = CMD_GET_USER_INFO;
+    user_info_.call(user_record.uid,user_record.name,user_record.admin);
+    command_result_.call(cmd,result);
+    if (directory_active_ && pending_cmd_ == CMD_GET_USER_INFO) request_next_user_();
+    return;
+  }
   if (cmd == CMD_VERIFY) on_recognized_callback_.call(last_user_name_,last_uid_);
   else if (cmd == CMD_SCAN_QR_CODE) on_qr_scanned_callback_.call(last_qr_data_);
   else if (enrollment_command_(cmd)) enrollment_success_.call(last_uid_);
-  else if (cmd == CMD_GET_USER_INFO) user_info_.call(uid_of(data),bounded_string(data+2,32),data[34]!=0);
+  else if (cmd == CMD_GET_USER_INFO) user_info_.call(user_record.uid,user_record.name,user_record.admin);
   else if (cmd == CMD_GET_ALL_USERID && !more) users_received_.call(user_count_);
   if (cmd != CMD_GET_ALL_USERID || !more) command_result_.call(cmd,result);
 }
