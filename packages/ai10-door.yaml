@@ -234,8 +234,11 @@ button:
 text_sensor:
   - platform: template
     name: "Stanje arhiviranja fotografije"
+    id: ai_archive_status
     lambda: |-
-      return id(ai10_camera)->get_capture_status() + " | " + id(ai10_camera)->get_archive_status();
+      auto value = id(ai10_camera)->get_capture_status() + " | " + id(ai10_camera)->get_archive_status();
+      if (id(ai_archive_status).has_state() && id(ai_archive_status).state == value) return {};
+      return value;
     update_interval: 1s
   - platform: template
     name: "Zadnji prepoznani uporabnik"
@@ -255,7 +258,11 @@ text_sensor:
     update_interval: never
   - platform: template
     name: "Registrirani uporabniki - seznam"
-    lambda: return id(ai10_sensor)->get_user_summary();
+    id: ai_registered_users
+    lambda: |-
+      auto value = id(ai10_sensor)->get_user_summary();
+      if (id(ai_registered_users).has_state() && id(ai_registered_users).state == value) return {};
+      return value;
     update_interval: 3s
 sensor:
   - platform: template
@@ -265,10 +272,15 @@ sensor:
     update_interval: never
   - platform: template
     name: "Število registriranih uporabnikov"
+    id: ai_registered_count
     accuracy_decimals: 0
     lambda: |-
-      if (!id(ai10_sensor)->is_user_list_complete()) return NAN;
-      return float(id(ai10_sensor)->get_user_count());
+      float value = id(ai10_sensor)->is_user_list_complete() ? float(id(ai10_sensor)->get_user_count()) : NAN;
+      if (id(ai_registered_count).has_state()) {
+        float previous = id(ai_registered_count).state;
+        if (previous == value || (std::isnan(previous) && std::isnan(value))) return {};
+      }
+      return value;
     update_interval: 3s
 binary_sensor:
   - platform: template
