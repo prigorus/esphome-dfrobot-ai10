@@ -50,7 +50,7 @@ class AI10SnapshotCamera : public camera::Camera {
   void request_image(camera::CameraRequester requester) override;
   void start_stream(camera::CameraRequester requester) override;
   void stop_stream(camera::CameraRequester requester) override;
-  // Manual shutter only. API requests return cached JPEG, never interrupt recognition.
+  // Explicit shutter pauses/resumes continuous recognition; API requests only serve the cached JPEG.
   void set_failed_capture_threshold(uint8_t n) { failure_threshold_=n; }
   void set_auto_capture_enabled(bool enabled) { auto_enabled_=enabled; if (!enabled) failure_count_=0; }
   bool is_auto_capture_enabled() const { return auto_enabled_; }
@@ -84,6 +84,10 @@ class AI10SnapshotCamera : public camera::Camera {
   uint8_t failure_threshold_{3}, failure_count_{0}, resume_timeout_{30};
   int16_t resume_attempts_{-1};
   bool auto_enabled_{false}, fallback_snapshot_{true}, archive_in_flight_{false}, archive_attempted_{false};
+  bool resume_recognition_{false}, archive_capture_{false};
+  uint8_t requested_capture_cmd_{0x71}, restart_attempts_{0};
+  bool request_manual_snapshot_(uint8_t command);
+  void begin_capture_cycle_(uint8_t command, bool archive, bool resume);
   uint32_t phase_started_{0}, retry_ms_{60000}, archive_last_attempt_{0};
   uint32_t archive_sequence_{0};
   std::string archive_status_{"No pending image"};

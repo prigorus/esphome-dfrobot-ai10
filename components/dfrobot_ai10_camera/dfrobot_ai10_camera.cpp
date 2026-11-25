@@ -29,8 +29,39 @@ void AI10SnapshotCamera::setup() {
 void AI10SnapshotCamera::dump_config() {
   ESP_LOGCONFIG(TAG,"AI10 UART still camera (240x320 / 320x320 face), max JPEG bytes: %u",unsigned(max_bytes_));
 }
-bool AI10SnapshotCamera::take_snapshot() { return take_snapshot_(0x71); }
-bool AI10SnapshotCamera::take_face_snapshot() { return take_snapshot_(0x72); }
+bool AI10SnapshotCamera::take_snapshot() { return request_manual_snapshot_(0x71); }
+bool AI10SnapshotCamera::take_face_snapshot() { return request_manual_snapshot_(0x72); }
+bool AI10SnapshotCamera::request_manual_snapshot_(uint8_t command) {
+  if (phase_!=IDLE || capturing_) {
+    ESP_LOGW(TAG,"Capture request ignored: another capture cycle is active");
+    return false;
+  }
+  if (has_pending_archive()) {
+    ESP_LOGW(TAG,"Capture request ignored: previous archive awaiting confirmation");
+    return false;
+  }
+  bool resume=parent_->is_continuous_recognition_active();
+  if (!resume && !parent_->can_capture_snapshot()) {
+    status_="Sensor busy";
+    ESP_LOGW(TAG,"%s",status_.c_str());
+    return false;
+  }
+  begin_capture_cycle_(command,false,resume);
+  return true;
+}
+void AI10SnapshotCamera::begin_capture_cycle_(uint8_t command, bool archive, bool resume) {
+  requested_capture_cmd_=command; archive_capture_=archive; resume_recognition_=resume;
+  last_capture_succeeded_=false; restart_attempts_=0;
+  if (resume) {
+    resume_timeout_=parent_->get_recognition_timeout();
+    resume_attempts_=parent_->get_recognition_max_attempts();
+    status_="Pausing recognition";
+    parent_->stop_recognition();
+  } else {
+    status_="Waiting for capture";
+  }
+  set_phase_(WAIT_STOP);
+}
 bool AI10SnapshotCamera::hold_for_archive(const std::string &token) {
   if (token.empty() || capturing_ || !image_ || !last_capture_succeeded_ || has_pending_archive()) return false;
   archive_token_=token;
@@ -132,14 +163,14 @@ void AI10SnapshotCamera::set_phase_(Phase phase) {
   phase_=phase; phase_started_=millis();
 }
 void AI10SnapshotCamera::finish_auto_capture_() {
-  if (last_capture_succeeded_) {
+  if (archive_capture_ && last_capture_succeeded_) {
     char token[48];
     snprintf(token,sizeof(token),"%08lx_%08lx_%08lx",
       (unsigned long) random_uint32(), (unsigned long) random_uint32(), (unsigned long) ++archive_sequence_);
     if (!hold_for_archive(token)) ESP_LOGW(TAG,"Could not protect image for archive");
   }
-  failure_count_=0;
-  set_phase_(RESTART);
+  if (archive_capture_) failure_count_=0;
+  set_phase_(resume_recognition_ ? RESTART : IDLE);
 }
 void AI10SnapshotCamera::auto_capture_loop_() {
   uint32_t elapsed=millis()-phase_started_;
@@ -149,26 +180,26 @@ void AI10SnapshotCamera::auto_capture_loop_() {
       if (!auto_enabled_ || has_pending_archive() || !parent_->is_continuous_recognition_active()) {
         cancel_auto_capture(); break;
       }
-      resume_timeout_=parent_->get_recognition_timeout();
-      resume_attempts_=parent_->get_recognition_max_attempts();
-      parent_->stop_recognition();
-      set_phase_(WAIT_STOP);
+      begin_capture_cycle_(0x72,true,true);
       break;
     case WAIT_STOP:
       if (parent_->can_capture_snapshot()) {
-        if (take_face_snapshot()) set_phase_(FACE);
+        if (take_snapshot_(requested_capture_cmd_)) set_phase_(requested_capture_cmd_==0x72 ? FACE : FULL);
         else if (elapsed>6000) finish_auto_capture_();
-      } else if (elapsed>6000) { last_capture_succeeded_=false; set_phase_(RESTART); }
+      } else if (elapsed>6000) {
+        fail_("Sensor did not become idle for capture");
+        finish_auto_capture_();
+      }
       break;
     case FACE:
       if (!capturing_) {
-        if (last_capture_succeeded_ || !fallback_snapshot_) finish_auto_capture_();
+        if (last_capture_succeeded_ || !archive_capture_ || !fallback_snapshot_) finish_auto_capture_();
         else { parent_->send_reset(); set_phase_(WAIT_FALLBACK); }
       }
       break;
     case WAIT_FALLBACK:
       if (parent_->can_capture_snapshot()) {
-        if (take_snapshot()) set_phase_(FULL);
+        if (take_snapshot_(0x71)) set_phase_(FULL);
         else if (elapsed>6000) finish_auto_capture_();
       } else if (elapsed>6000) finish_auto_capture_();
       break;
@@ -179,17 +210,25 @@ void AI10SnapshotCamera::auto_capture_loop_() {
       if (parent_->can_capture_snapshot()) {
         if (resume_attempts_<0) parent_->start_recognition(resume_timeout_,true);
         else parent_->start_recognition(resume_timeout_,true,uint8_t(resume_attempts_));
+        ++restart_attempts_;
         set_phase_(WAIT_RESTART);
       } else if (elapsed>8000) {
         ESP_LOGE(TAG,"Cannot restart recognition: module still busy");
+        status_="Recognition restart failed: sensor busy";
         set_phase_(IDLE);
       }
       break;
     case WAIT_RESTART:
       if (parent_->is_continuous_recognition_active()) set_phase_(IDLE);
       else if (elapsed>5000) {
-        ESP_LOGE(TAG,"Recognition restart not acknowledged");
-        set_phase_(IDLE);
+        if (restart_attempts_<2 && parent_->can_capture_snapshot()) {
+          ESP_LOGW(TAG,"Recognition restart not acknowledged; retrying");
+          set_phase_(RESTART);
+        } else {
+          ESP_LOGE(TAG,"Recognition restart not acknowledged");
+          status_="Recognition restart failed";
+          set_phase_(IDLE);
+        }
       }
       break;
   }

@@ -39,14 +39,12 @@ dfrobot_ai10:
           id(ai_last_uid).publish_state(uid);
           id(ai_last_type).publish_state(uid > 1000 ? "Dlan" : "Obraz");
           id(ai_last_admin).publish_state(id(ai10_sensor)->get_last_admin());
-          id(ai_event).publish_state("Prepoznavanje uspešno");
       - script.execute: ai_recognition_pulse
   on_recognition_failed:
     then:
       - script.stop: ai_recognition_pulse
       - lambda: |-
           id(ai_unlock_pulse).publish_state(false);
-          id(ai_event).publish_state("Prepoznavanje neuspešno: " + std::to_string(result));
   on_enrollment_success:
     then:
       - lambda: |-
@@ -58,14 +56,6 @@ dfrobot_ai10:
   on_qr_scanned:
     then:
       - lambda: id(ai_last_qr).publish_state(qr_data);
-  on_user_directory:
-    then:
-      - lambda: |-
-          id(ai_directory_status).publish_state("Osveženo: " + std::to_string(count));
-  on_user_directory_failed:
-    then:
-      - lambda: |-
-          id(ai_directory_status).publish_state("Napaka: " + std::to_string(result));
 
 dfrobot_ai10_camera:
   id: ai10_camera
@@ -164,8 +154,6 @@ switch:
     id: ai_new_user_admin
     optimistic: true
     restore_mode: ALWAYS_OFF
-  - platform: restart
-    name: "Ponovni zagon ESP32"
 
 number:
   - platform: template
@@ -178,43 +166,30 @@ number:
     initial_value: 1
     restore_value: false
     mode: box
-  - platform: template
-    name: "Čas prepoznavanja"
-    id: ai_recognition_timeout
-    min_value: 1
-    max_value: 255
-    step: 1
-    unit_of_measurement: s
-    optimistic: true
-    initial_value: ${ai10_timeout}
-    restore_value: true
-    mode: box
 
 button:
   - platform: template
     name: "Zajemi fotografijo"
     icon: mdi:camera
     on_press:
-      - lambda: |-
-          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_camera)->take_snapshot();
+      - lambda: id(ai10_camera)->take_snapshot();
   - platform: template
     name: "Zajemi obraz 320x320"
     icon: mdi:face-recognition
     on_press:
-      - lambda: |-
-          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_camera)->take_face_snapshot();
+      - lambda: id(ai10_camera)->take_face_snapshot();
   - platform: template
     name: "Začni samodejno prepoznavanje"
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active())
-            id(ai10_sensor)->start_recognition(uint8_t(id(ai_recognition_timeout).state), true);
+            id(ai10_sensor)->start_recognition(uint8_t(${ai10_timeout}), true);
   - platform: template
     name: "Enkratno prepoznavanje"
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active())
-            id(ai10_sensor)->start_recognition(uint8_t(id(ai_recognition_timeout).state), false);
+            id(ai10_sensor)->start_recognition(uint8_t(${ai10_timeout}), false);
   - platform: template
     name: "Ustavi prepoznavanje"
     on_press:
@@ -254,11 +229,8 @@ button:
 text_sensor:
   - platform: template
     name: "Stanje arhiviranja fotografije"
-    lambda: return id(ai10_camera)->get_archive_status();
-    update_interval: 1s
-  - platform: template
-    name: "Stanje zajema fotografije"
-    lambda: return id(ai10_camera)->get_capture_status();
+    lambda: |-
+      return id(ai10_camera)->get_capture_status() + " | " + id(ai10_camera)->get_archive_status();
     update_interval: 1s
   - platform: template
     name: "Zadnji prepoznani uporabnik"
@@ -277,43 +249,10 @@ text_sensor:
     id: ai_enrollment_result
     update_interval: never
   - platform: template
-    name: "Zadnji dogodek AI10"
-    id: ai_event
-    update_interval: never
-  - platform: template
-    name: "Stanje seznama uporabnikov"
-    id: ai_directory_status
-    update_interval: never
-  - platform: template
     name: "Registrirani uporabniki - seznam"
     lambda: return id(ai10_sensor)->get_user_summary();
     update_interval: 3s
-  - platform: template
-    name: "Registrirani uporabniki - UID"
-    lambda: |-
-      if (!id(ai10_sensor)->is_user_list_complete()) return std::string();
-      std::string out;
-      for (auto uid : id(ai10_sensor)->get_user_ids()) {
-        auto s=std::to_string(uid);
-        if (out.size()+s.size()+2>240) { out+="..."; break; }
-        if (!out.empty()) out+=", ";
-        out+=s;
-      }
-      return out;
-    update_interval: 3s
-
 sensor:
-  - platform: template
-    name: "Zaporedna neuspešna prepoznavanja"
-    accuracy_decimals: 0
-    lambda: return id(ai10_camera)->get_failed_count();
-    update_interval: 1s
-  - platform: template
-    name: "Velikost fotografije"
-    unit_of_measurement: "kB"
-    accuracy_decimals: 2
-    lambda: return id(ai10_camera)->get_image_size()/1000.0f;
-    update_interval: 1s
   - platform: template
     name: "Zadnji prepoznani UID"
     id: ai_last_uid
@@ -326,43 +265,10 @@ sensor:
       if (!id(ai10_sensor)->is_user_list_complete()) return NAN;
       return float(id(ai10_sensor)->get_user_count());
     update_interval: 3s
-  - platform: template
-    name: "Število registriranih obrazov"
-    accuracy_decimals: 0
-    lambda: |-
-      if (!id(ai10_sensor)->is_user_list_complete()) return NAN;
-      unsigned n=0;
-      for (auto uid:id(ai10_sensor)->get_user_ids()) if (uid<=1000) ++n;
-      return float(n);
-    update_interval: 3s
-  - platform: template
-    name: "Število registriranih dlani"
-    accuracy_decimals: 0
-    lambda: |-
-      if (!id(ai10_sensor)->is_user_list_complete()) return NAN;
-      unsigned n=0;
-      for (auto uid:id(ai10_sensor)->get_user_ids()) if (uid>1000) ++n;
-      return float(n);
-    update_interval: 3s
-
 binary_sensor:
-  - platform: template
-    name: "Fotografija čaka na arhiviranje"
-    lambda: return id(ai10_camera)->has_pending_archive();
-  - platform: template
-    name: "Zajem fotografije v teku"
-    lambda: return id(ai10_camera)->is_capturing();
   - platform: template
     name: "Prepoznavanje uspešno - impulz"
     id: ai_unlock_pulse
   - platform: template
     name: "Zadnji prepoznani je administrator"
     id: ai_last_admin
-  - platform: template
-    name: "Obraz ali dlan zaznana"
-    lambda: return id(ai10_sensor)->is_face_detected();
-  - platform: template
-    name: "Seznam uporabnikov popoln"
-    lambda: return id(ai10_sensor)->is_user_directory_complete();
-  - platform: status
-    name: "ESP32 povezava"
