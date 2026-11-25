@@ -7,6 +7,9 @@ substitutions:
   ai10_failure_threshold: "3"
   ai10_fallback: "true"
   ai10_timeout: "30"
+  ai10_recognition_mode: "eco"
+  ai10_snapshot_resolution: "240x320"
+  ai10_max_image_bytes: "49152"
 
 esphome:
   on_boot:
@@ -31,6 +34,7 @@ dfrobot_ai10:
   auto_refresh_users: true
   resume_recognition_after_refresh: true
   documented_qr: false
+  recognition_mode: ${ai10_recognition_mode}
   allow_sensitive_transfers: true
   on_recognized:
     then:
@@ -61,7 +65,8 @@ dfrobot_ai10_camera:
   id: ai10_camera
   name: "Vhodna vrata kamera"
   ai10_id: ai10_sensor
-  max_image_bytes: 49152
+  max_image_bytes: ${ai10_max_image_bytes}
+  snapshot_resolution: ${ai10_snapshot_resolution}
   auto_capture_enabled: ${ai10_auto_capture}
   failed_capture_threshold: ${ai10_failure_threshold}
   fallback_snapshot: ${ai10_fallback}

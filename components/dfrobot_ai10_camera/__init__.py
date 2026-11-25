@@ -16,6 +16,7 @@ CONFIG_SCHEMA = cv.ENTITY_BASE_SCHEMA.extend({
     cv.GenerateID(): cv.declare_id(AI10SnapshotCamera),
     cv.Required(CONF_AI10_ID): cv.use_id(DFRobotAI10Component),
     cv.Optional(CONF_MAX_IMAGE_BYTES, default=49152): cv.int_range(min=4096, max=65536),
+    cv.Optional("snapshot_resolution", default="240x320"): cv.one_of("240x320", "480x640", "600x800", "1200x1600", lower=True),
     cv.Optional("failed_capture_threshold", default=3): cv.int_range(min=1, max=20),
     cv.Optional("auto_capture_enabled", default=False): cv.boolean,
     cv.Optional("fallback_snapshot", default=True): cv.boolean,
@@ -31,6 +32,7 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_AI10_ID])
     cg.add(var.set_parent(parent))
     cg.add(var.set_max_image_bytes(config[CONF_MAX_IMAGE_BYTES]))
+    cg.add(var.set_snapshot_resolution(["240x320", "480x640", "600x800", "1200x1600"].index(config["snapshot_resolution"])))
 
     cg.add(var.set_failed_capture_threshold(config["failed_capture_threshold"]))
     cg.add(var.set_auto_capture_enabled(config["auto_capture_enabled"]))

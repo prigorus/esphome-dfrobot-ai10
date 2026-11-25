@@ -101,6 +101,12 @@ void DFRobotAI10Component::loop() {
     refresh_queued_ = false;
     refresh_users();
   }
+  if (repeat_wait_ && !waiting_reset_ && pending_cmd_ == CMD_VERIFY &&
+      stored_continuous_ && !suppress_verify_ && now - repeat_started_ >= 1000) {
+    repeat_wait_ = false;
+    pending_action_ = PENDING_VERIFY;
+    execute_pending_action_();
+  }
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
     this->last_status_log_ = now;
     ESP_LOGD(TAG, "Parser state: %s, last result: %s",
@@ -124,6 +130,7 @@ void DFRobotAI10Component::cancel_stop_() {
   stop_in_progress_ = false;
 }
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
+  repeat_wait_ = false;
   bool failed_directory = directory_active_;
   cancel_directory_();
   bool enroll = enrollment_command_(cmd) || (cmd == CMD_RESET && (pending_action_ == PENDING_ENROLL || (pending_action_ == PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
@@ -142,6 +149,7 @@ void DFRobotAI10Component::transmit_reset_() {
   send_packet_(data, sizeof(data));
 }
 void DFRobotAI10Component::send_reset() {
+  repeat_wait_ = false;
   cancel_stop_(); cancel_directory_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
   clear_transfer_();
   suppress_verify_ = true; invalidate_auth_();
@@ -156,6 +164,7 @@ bool DFRobotAI10Component::prepare_(PendingAction action) {
       (action == PENDING_EXTENDED && auto_refresh_users_))
     remember_recognition_();
   else if (!directory_active_) resume_pending_ = false;
+  repeat_wait_ = false;
   cancel_stop_(); suppress_verify_ = true; invalidate_auth_();
   pending_cmd_ = 0; pending_action_ = action;
   return true;
@@ -390,9 +399,9 @@ void DFRobotAI10Component::execute_pending_action_() {
   switch (this->pending_action_) {
     case PENDING_VERIFY: {
       uint8_t data[] = {CMD_VERIFY, 0, uint8_t(max_attempts_ < 0 ? 2 : 3),
-        uint8_t(stored_continuous_ ? 1 : 0), stored_timeout_, uint8_t(max_attempts_)};
+        uint8_t(stored_continuous_ && !full_scan_ ? 1 : 0), stored_timeout_, uint8_t(max_attempts_)};
       suppress_verify_ = false;
-      command_timeout_ms_ = stored_continuous_ ? 0x7FFFFFFFUL : uint32_t(stored_timeout_)*1000+3000;
+      command_timeout_ms_ = stored_continuous_ && !full_scan_ ? 0x7FFFFFFFUL : uint32_t(stored_timeout_)*1000+3000;
       send_packet_(data, max_attempts_ < 0 ? 5 : 6);
       this->pending_cmd_ = CMD_VERIFY;
       this->recognized_ = false; // Reset auth state on new verify start
@@ -523,6 +532,13 @@ void DFRobotAI10Component::process_packet_(uint8_t msg_id, const uint8_t *payloa
   }
 }
 
+void DFRobotAI10Component::schedule_repeat_() {
+  // Hold the logical VERIFY operation active so shutters and directory refresh can pause it.
+  // Ignore late replies/notes between single-shot cycles.
+  repeat_wait_ = true;
+  repeat_started_ = command_started_ = millis();
+  command_timeout_ms_ = 4000;
+}
 void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (len < 2) {
     ESP_LOGW(TAG, "Reply too short: %d bytes", len);
@@ -539,7 +555,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     execute_pending_action_();
     return;
   }
-  if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && suppress_verify_)) return;
+  if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && (suppress_verify_ || repeat_wait_))) return;
   if (result == RES_SUCCESS && transfer_sink_ && (cmd==0x71 || cmd==0x72 || cmd==0x74 || cmd==0xFA)) {
     if (transfer_seq_ || n < (cmd==0x72?6:4)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
     transfer_size_=uint32_t(data[0])<<24 | uint32_t(data[1])<<16 | uint32_t(data[2])<<8 | data[3];
@@ -564,6 +580,14 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   bool continuous = cmd == CMD_VERIFY && stored_continuous_;
   if (result != RES_SUCCESS) {
     if (continuous) {
+      if (full_scan_) {
+        // Repeat only normal negative recognition outcomes, not transport/hardware faults.
+        if (result != RES_FAILED_UNKNOWN_USER && result != RES_FAILED_LIVE_CHECK &&
+            result != RES_FAILED_TIMEOUT && result != 0x1A) {
+          fail_command_(cmd,result); return;
+        }
+        schedule_repeat_();
+      }
       invalidate_auth_(); last_result_ = result;
       recognition_failed_.call(result); command_result_.call(cmd, result);
     } else fail_command_(cmd, result);
@@ -656,7 +680,10 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     if (directory_active_ && pending_cmd_ == CMD_GET_USER_INFO) request_next_user_();
     return;
   }
-  if (cmd == CMD_VERIFY) on_recognized_callback_.call(last_user_name_,last_uid_);
+  if (cmd == CMD_VERIFY) {
+    if (continuous && full_scan_) schedule_repeat_();
+    on_recognized_callback_.call(last_user_name_,last_uid_);
+  }
   else if (cmd == CMD_SCAN_QR_CODE) on_qr_scanned_callback_.call(last_qr_data_);
   else if (enrollment_command_(cmd)) enrollment_success_.call(last_uid_);
   else if (cmd == CMD_GET_USER_INFO) user_info_.call(user_record.uid,user_record.name,user_record.admin);
@@ -671,7 +698,13 @@ void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {
     if (setup_done_ && (waiting_reset_ || pending_cmd_)) fail_command_(waiting_reset_?CMD_RESET:pending_cmd_,RES_ABORTED);
     module_status_=0; return;
   }
-  if (waiting_reset_ || (pending_cmd_ != CMD_VERIFY && !enrollment_command_(pending_cmd_))) return;
+  if (waiting_reset_ || repeat_wait_ || (pending_cmd_ != CMD_VERIFY && !enrollment_command_(pending_cmd_))) return;
+  if (pending_cmd_ == CMD_VERIFY && !suppress_verify_ && len >= 2 && len <= 251 && payload[0] == 0x0F) {
+    // QR is an observation, never an authorization event.
+    last_qr_data_.assign(reinterpret_cast<const char *>(payload+1),len-1);
+    on_qr_scanned_callback_.call(last_qr_data_);
+    return;
+  }
   if (len >= 17 && payload[0]==1) {
     uint8_t nid = payload[0];
     int16_t state = (payload[1] << 8) | payload[2];

@@ -42,6 +42,8 @@ class AI10SnapshotCamera : public camera::Camera {
  public:
   void set_parent(dfrobot_ai10::DFRobotAI10Component *parent) { parent_=parent; }
   void set_max_image_bytes(size_t bytes) { max_bytes_=bytes; }
+  // 0 = legacy snapshot; 1..3 = documented 0x74 DPI 0..2.
+  void set_snapshot_resolution(uint8_t value) { snapshot_resolution_=value; }
   void setup() override;
   void loop() override;
   void dump_config() override;
@@ -96,7 +98,8 @@ class AI10SnapshotCamera : public camera::Camera {
   void auto_capture_loop_();
   void archive_loop_();
   void finish_auto_capture_();
-  uint8_t capture_cmd_{0x71};
+  uint8_t capture_cmd_{0x71}, snapshot_resolution_{0};
+  uint8_t full_snapshot_command_() const { return snapshot_resolution_ ? 0x74 : 0x71; }
   std::string archive_token_;
   bool take_snapshot_(uint8_t command);
   uint8_t streams_{0};

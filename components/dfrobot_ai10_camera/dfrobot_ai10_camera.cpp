@@ -29,7 +29,7 @@ void AI10SnapshotCamera::setup() {
 void AI10SnapshotCamera::dump_config() {
   ESP_LOGCONFIG(TAG,"AI10 UART still camera (240x320 / 320x320 face), max JPEG bytes: %u",unsigned(max_bytes_));
 }
-bool AI10SnapshotCamera::take_snapshot() { return request_manual_snapshot_(0x71); }
+bool AI10SnapshotCamera::take_snapshot() { return request_manual_snapshot_(full_snapshot_command_()); }
 bool AI10SnapshotCamera::take_face_snapshot() { return request_manual_snapshot_(0x72); }
 bool AI10SnapshotCamera::request_manual_snapshot_(uint8_t command) {
   if (phase_!=IDLE || capturing_) {
@@ -95,9 +95,10 @@ bool AI10SnapshotCamera::take_snapshot_(uint8_t command) {
   pending_.reset();
   expected_=received_=0;
   capturing_=true; capture_cmd_=command; capture_start_=millis(); status_="Capturing";
-  if (!parent_->capture_image(command,0,[this](const uint8_t *data,size_t len) {
+  uint8_t dpi = command == 0x74 ? snapshot_resolution_-1 : 0;
+  if (!parent_->capture_image(command,dpi,[this](const uint8_t *data,size_t len) {
       return accept_chunk_(data,len);
-    }, command==0x72 ? 8000 : 10000)) {
+    }, command==0x72 ? 8000 : (command==0x74 ? 20000 : 10000))) {
     fail_("Capture rejected: enable allow_sensitive_transfers");
     return false;
   }
@@ -199,7 +200,7 @@ void AI10SnapshotCamera::auto_capture_loop_() {
       break;
     case WAIT_FALLBACK:
       if (parent_->can_capture_snapshot()) {
-        if (take_snapshot_(0x71)) set_phase_(FULL);
+        if (take_snapshot_(full_snapshot_command_())) set_phase_(FULL);
         else if (elapsed>6000) finish_auto_capture_();
       } else if (elapsed>6000) finish_auto_capture_();
       break;

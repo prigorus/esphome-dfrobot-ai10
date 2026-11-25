@@ -39,6 +39,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(DFRobotAI10Component),
         cv.Optional("documented_qr", default=False): cv.boolean,
+        cv.Optional("recognition_mode", default="eco"): cv.one_of("eco", "full", lower=True),
         cv.Optional("auto_refresh_users", default=False): cv.boolean,
         cv.Optional("resume_recognition_after_refresh", default=False): cv.boolean,
         cv.Optional("on_user_directory"): automation.validate_automation({cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(UserDirectoryTrigger)}),
@@ -73,6 +74,7 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     cg.add(var.set_documented_qr(config['documented_qr']))
+    cg.add(var.set_full_scan(config['recognition_mode'] == 'full'))
     cg.add(var.set_auto_refresh_users(config['auto_refresh_users']))
     cg.add(var.set_resume_recognition_after_refresh(config['resume_recognition_after_refresh']))
     cg.add(var.set_allow_sensitive_transfers(config['allow_sensitive_transfers']))

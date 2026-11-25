@@ -118,6 +118,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   // Public API — call these from HA services or buttons
   void enroll_user(uint8_t admin, const char *name, uint8_t timeout);
   void start_recognition(uint8_t timeout, bool continuous);
+  void set_full_scan(bool value) { full_scan_ = value; }
   void delete_user(uint16_t uid);
   void delete_all_users();
   void get_all_user_ids();
@@ -276,6 +277,9 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   // Stored parameters for pending actions
   uint8_t stored_timeout_{0};
   bool stored_continuous_{false};
+  bool full_scan_{false}, repeat_wait_{false};
+  uint32_t repeat_started_{0};
+  void schedule_repeat_();
   uint8_t stored_admin_{0};
   std::string stored_name_;
   uint16_t stored_uid_{0};
