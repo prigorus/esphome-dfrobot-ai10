@@ -49,19 +49,23 @@ dfrobot_ai10:
           id(ai_event).publish_state("Prepoznavanje neuspešno: " + std::to_string(result));
   on_enrollment_success:
     then:
-      - lambda: id(ai_enrollment_result).publish_state("Registracija uspešna, UID: " + std::to_string(uid));
+      - lambda: |-
+          id(ai_enrollment_result).publish_state("Registracija uspešna, UID: " + std::to_string(uid));
   on_enrollment_failed:
     then:
-      - lambda: id(ai_enrollment_result).publish_state("Registracija neuspešna: " + std::to_string(result));
+      - lambda: |-
+          id(ai_enrollment_result).publish_state("Registracija neuspešna: " + std::to_string(result));
   on_qr_scanned:
     then:
       - lambda: id(ai_last_qr).publish_state(qr_data);
   on_user_directory:
     then:
-      - lambda: id(ai_directory_status).publish_state("Osveženo: " + std::to_string(count));
+      - lambda: |-
+          id(ai_directory_status).publish_state("Osveženo: " + std::to_string(count));
   on_user_directory_failed:
     then:
-      - lambda: id(ai_directory_status).publish_state("Napaka: " + std::to_string(result));
+      - lambda: |-
+          id(ai_directory_status).publish_state("Napaka: " + std::to_string(result));
 
 dfrobot_ai10_camera:
   id: ai10_camera
