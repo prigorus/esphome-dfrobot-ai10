@@ -62,7 +62,19 @@ button:
   - platform: template
     name: "Capture"
     on_press:
-      - lambda: id(ai10_camera)->take_snapshot();
+      - lambda: |-
+          if (id(ai10_sensor)->is_continuous_recognition_active()) return;
+          id(ai10_camera)->take_snapshot();
+  - platform: template
+    name: "Face capture"
+    on_press:
+      - lambda: id(ai10_camera)->take_face_snapshot();
+  - platform: template
+    name: "Archive handshake"
+    on_press:
+      - lambda: |-
+          if (id(ai10_camera)->last_capture_succeeded()) id(ai10_camera)->hold_for_archive("ci-test");
+          id(ai10_camera)->acknowledge_archive("ci-test");
 api:
 wifi:
   ssid: "CI-test-only"

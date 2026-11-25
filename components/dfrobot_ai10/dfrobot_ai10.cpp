@@ -321,12 +321,12 @@ void DFRobotAI10Component::send_extended_packet_(uint8_t cmd, const std::vector<
   packet.insert(packet.end(),data.begin(),data.end());
   send_packet_(packet.data(),packet.size());
 }
-bool DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink) {
+bool DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink, uint32_t first_reply_timeout_ms) {
   if (!allow_sensitive_transfers_ || !sink || (kind != 0x71 && kind != 0x72 && kind != 0x74) || resolution > 2 || !prepare_(PENDING_EXTENDED)) return false;
   transfer_sink_ = std::move(sink); transfer_size_ = transfer_received_ = 0; transfer_seq_ = 0; capture_uid_ = 0;
   extended_cmd_ = kind; extended_data_ = {0};
   if (kind == 0x74) extended_data_.push_back(resolution);
-  extended_timeout_ms_ = 30000; transmit_reset_();
+  extended_timeout_ms_ = std::max<uint32_t>(1000, first_reply_timeout_ms); transmit_reset_();
   return true;
 }
 void DFRobotAI10Component::export_template(uint16_t uid, uint8_t type, ChunkSink sink) {

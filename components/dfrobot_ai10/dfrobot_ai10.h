@@ -145,7 +145,8 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   // Explicit opt-in, streaming to caller-owned storage; never expose biometric bytes to HA logs.
   using ChunkSink = std::function<bool(const uint8_t *, size_t)>;
   void set_allow_sensitive_transfers(bool value) { allow_sensitive_transfers_ = value; }
-  bool capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink);
+  bool capture_image(uint8_t kind, uint8_t resolution, ChunkSink sink, uint32_t first_reply_timeout_ms = 30000);
+  bool is_continuous_recognition_active() const { return pending_cmd_ == CMD_VERIFY && stored_continuous_ && !suppress_verify_ && !waiting_reset_; }
   bool can_capture_snapshot() const { return setup_done_ && !is_busy() && !stop_in_progress_ && !refresh_queued_; }
   bool is_image_transfer_active() const { return bool(transfer_sink_); }
   void export_template(uint16_t uid, uint8_t type, ChunkSink sink);

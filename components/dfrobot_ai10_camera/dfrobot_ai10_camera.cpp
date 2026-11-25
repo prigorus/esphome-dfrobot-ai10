@@ -10,15 +10,32 @@ static const char *const TAG = "ai10_camera";
 void AI10SnapshotCamera::setup() {
   parent_->add_on_command_result_callback([this](uint8_t cmd, uint8_t result) {
     if (!capturing_) return;
-    if (cmd == 0x71) complete_(result);
+    if (cmd == capture_cmd_) complete_(result);
     else if (cmd == 0x10 && result != 0) fail_("Reset failed");
   });
 }
 void AI10SnapshotCamera::dump_config() {
-  ESP_LOGCONFIG(TAG,"AI10 manual UART camera, 240x320, max JPEG bytes: %u",unsigned(max_bytes_));
+  ESP_LOGCONFIG(TAG,"AI10 UART still camera (240x320 / 320x320 face), max JPEG bytes: %u",unsigned(max_bytes_));
 }
-bool AI10SnapshotCamera::take_snapshot() {
+bool AI10SnapshotCamera::take_snapshot() { return take_snapshot_(0x71); }
+bool AI10SnapshotCamera::take_face_snapshot() { return take_snapshot_(0x72); }
+bool AI10SnapshotCamera::hold_for_archive(const std::string &token) {
+  if (token.empty() || capturing_ || !image_ || !last_capture_succeeded_ || has_pending_archive()) return false;
+  archive_token_=token;
+  return true;
+}
+bool AI10SnapshotCamera::acknowledge_archive(const std::string &token) {
+  if (token.empty() || token!=archive_token_) return false;
+  archive_token_.clear();
+  return true;
+}
+bool AI10SnapshotCamera::take_snapshot_(uint8_t command) {
   if (capturing_) return false;
+  last_capture_succeeded_=false;
+  if (has_pending_archive()) {
+    ESP_LOGW(TAG,"Previous archive still awaiting Home Assistant confirmation");
+    return false;
+  }
   if (!parent_->can_capture_snapshot()) {
     status_="Sensor busy: stop recognition first";
     ESP_LOGW(TAG,"%s",status_.c_str());
@@ -33,10 +50,10 @@ bool AI10SnapshotCamera::take_snapshot() {
   image_.reset();
   pending_.reset();
   expected_=received_=0;
-  capturing_=true; capture_start_=millis(); status_="Capturing";
-  if (!parent_->capture_image(0x71,0,[this](const uint8_t *data,size_t len) {
+  capturing_=true; capture_cmd_=command; capture_start_=millis(); status_="Capturing";
+  if (!parent_->capture_image(command,0,[this](const uint8_t *data,size_t len) {
       return accept_chunk_(data,len);
-    })) {
+    }, command==0x72 ? 8000 : 10000)) {
     fail_("Capture rejected: enable allow_sensitive_transfers");
     return false;
   }
@@ -75,13 +92,14 @@ void AI10SnapshotCamera::complete_(uint8_t result) {
   image_=std::make_shared<SnapshotImage>(std::move(pending_),received_);
   capturing_=false;
   status_="Image ready";
+  last_capture_succeeded_=true;
   requested_=true;
   ESP_LOGI(TAG,"JPEG ready: %u bytes",unsigned(received_));
 }
 void AI10SnapshotCamera::fail_(const char *reason) {
   // Copy before assigning, since reason may point into status_.
   std::string message(reason);
-  capturing_=false; pending_.reset(); expected_=received_=0;
+  capturing_=false; last_capture_succeeded_=false; pending_.reset(); expected_=received_=0;
   status_=std::move(message);
   ESP_LOGW(TAG,"%s",status_.c_str());
 }

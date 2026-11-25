@@ -52,6 +52,12 @@ class AI10SnapshotCamera : public camera::Camera {
   void stop_stream(camera::CameraRequester requester) override;
   // Manual shutter only. API requests return cached JPEG, never interrupt recognition.
   bool take_snapshot();
+  bool take_face_snapshot();
+  bool has_pending_archive() const { return !archive_token_.empty(); }
+  const std::string &get_archive_token() const { return archive_token_; }
+  bool hold_for_archive(const std::string &token);
+  bool acknowledge_archive(const std::string &token);
+  bool last_capture_succeeded() const { return last_capture_succeeded_; }
   bool is_capturing() const { return capturing_; }
   size_t get_image_size() const { return image_ ? image_->get_data_length() : 0; }
   const std::string &get_capture_status() const { return status_; }
@@ -61,7 +67,10 @@ class AI10SnapshotCamera : public camera::Camera {
   Bytes pending_;
   std::shared_ptr<SnapshotImage> image_;
   std::vector<camera::CameraListener *> listeners_;
-  bool capturing_{false}, requested_{false};
+  bool capturing_{false}, requested_{false}, last_capture_succeeded_{false};
+  uint8_t capture_cmd_{0x71};
+  std::string archive_token_;
+  bool take_snapshot_(uint8_t command);
   uint8_t streams_{0};
   uint32_t last_publish_{0}, capture_start_{0};
   std::string status_{"No image"};
