@@ -559,7 +559,10 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (result == RES_SUCCESS && transfer_sink_ && (cmd==0x71 || cmd==0x72 || cmd==0x74 || cmd==0xFA)) {
     if (transfer_seq_ || n < (cmd==0x72?6:4)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
     transfer_size_=uint32_t(data[0])<<24 | uint32_t(data[1])<<16 | uint32_t(data[2])<<8 | data[3];
-    if (!transfer_size_ || transfer_size_ > (cmd==0xFA?16384UL:255UL*1024)) { fail_command_(cmd,RES_FAILED_INVALID_PARAM); return; }
+    if (!transfer_size_ || transfer_size_ > (cmd==0xFA?16384UL:255UL*1024)) {
+      ESP_LOGW(TAG,"Transfer 0x%02X length %lu exceeds protocol bounds",cmd,(unsigned long)transfer_size_);
+      fail_command_(cmd,RES_FAILED_INVALID_PARAM); return;
+    }
     if (cmd==0x72) capture_uid_=uint16_t(data[4])<<8|data[5];
     request_chunk_(); return;
   }

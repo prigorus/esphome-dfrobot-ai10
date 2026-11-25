@@ -1,7 +1,7 @@
 substitutions:
   ai10_recognition_mode: "full"
   ai10_snapshot_resolution: "480x640"
-  ai10_max_image_bytes: "65536"
+  ai10_max_image_bytes: "131072"
 esphome:
   name: ai10-package-ci
 esp32:

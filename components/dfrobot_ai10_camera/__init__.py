@@ -15,7 +15,7 @@ ArchiveRequestTrigger = ns.class_("ArchiveRequestTrigger", automation.Trigger.te
 CONFIG_SCHEMA = cv.ENTITY_BASE_SCHEMA.extend({
     cv.GenerateID(): cv.declare_id(AI10SnapshotCamera),
     cv.Required(CONF_AI10_ID): cv.use_id(DFRobotAI10Component),
-    cv.Optional(CONF_MAX_IMAGE_BYTES, default=49152): cv.int_range(min=4096, max=65536),
+    cv.Optional(CONF_MAX_IMAGE_BYTES, default=49152): cv.int_range(min=4096, max=261120),
     cv.Optional("snapshot_resolution", default="240x320"): cv.one_of("240x320", "480x640", "600x800", "1200x1600", lower=True),
     cv.Optional("failed_capture_threshold", default=3): cv.int_range(min=1, max=20),
     cv.Optional("auto_capture_enabled", default=False): cv.boolean,

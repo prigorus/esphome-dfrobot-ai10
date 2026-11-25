@@ -3,6 +3,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
 #include <cstring>
+#ifdef USE_ESP32
+#include <esp_heap_caps.h>
+#endif
 
 namespace esphome {
 namespace dfrobot_ai10_camera {
@@ -108,10 +111,27 @@ bool AI10SnapshotCamera::accept_chunk_(const uint8_t *data,size_t len) {
   if (!capturing_) return false;
   if (!pending_) {
     expected_=parent_->get_transfer_size();
+    ESP_LOGI(TAG,"JPEG announced: %u bytes; configured limit: %u bytes",
+      unsigned(expected_),unsigned(max_bytes_));
+#ifdef USE_ESP32
+    const size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG,"JPEG heap: free=%u bytes, largest block=%u bytes",
+      unsigned(free_heap),unsigned(largest));
+#endif
     if (expected_<4 || expected_>max_bytes_) {
-      status_="Image exceeds configured size limit";
+      status_="JPEG size "+std::to_string(expected_)+" exceeds limit "+std::to_string(max_bytes_);
       return false;
     }
+#ifdef USE_ESP32
+    // Keep headroom for Wi-Fi/native API and other allocations during image transfer.
+    constexpr size_t reserve = 32768;
+    if (largest < expected_ || free_heap < expected_+reserve) {
+      status_="Not enough RAM for JPEG ("+std::to_string(expected_)+" bytes; largest block "+
+        std::to_string(largest)+"; free "+std::to_string(free_heap)+")";
+      return false;
+    }
+#endif
     if (len<2 || data[0]!=0xFF || data[1]!=0xD8) {
       status_="Not a JPEG: missing SOI";
       return false;
