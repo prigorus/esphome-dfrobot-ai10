@@ -1,0 +1,22 @@
+esphome:
+  name: ai10-package-ci
+esp32:
+  board: BOARD_NAME
+  framework:
+    type: esp-idf
+logger:
+external_components:
+  - source:
+      type: local
+      path: components
+uart:
+  id: uart_ai10
+  rx_pin: GPIO4
+  tx_pin: GPIO5
+  baud_rate: 115200
+  rx_buffer_size: 2048
+wifi:
+  ssid: "CI-test-only"
+  password: "not-a-real-password"
+packages:
+  ai10: !include packages/ai10-door.yaml

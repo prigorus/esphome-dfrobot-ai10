@@ -51,6 +51,17 @@ class AI10SnapshotCamera : public camera::Camera {
   void start_stream(camera::CameraRequester requester) override;
   void stop_stream(camera::CameraRequester requester) override;
   // Manual shutter only. API requests return cached JPEG, never interrupt recognition.
+  void set_failed_capture_threshold(uint8_t n) { failure_threshold_=n; }
+  void set_auto_capture_enabled(bool enabled) { auto_enabled_=enabled; if (!enabled) failure_count_=0; }
+  bool is_auto_capture_enabled() const { return auto_enabled_; }
+  uint8_t get_failed_count() const { return failure_count_; }
+  bool is_auto_capture_active() const { return phase_!=IDLE; }
+  void cancel_auto_capture() { phase_=IDLE; failure_count_=0; }
+  void set_fallback_snapshot(bool enabled) { fallback_snapshot_=enabled; }
+  void set_archive_retry_interval(uint32_t ms) { retry_ms_=ms; }
+  void add_on_archive_request_callback(std::function<void(std::string)> &&cb) { archive_request_.add(std::move(cb)); }
+  void archive_result(const std::string &token, bool success);
+  const std::string &get_archive_status() const { return archive_status_; }
   bool take_snapshot();
   bool take_face_snapshot();
   bool has_pending_archive() const { return !archive_token_.empty(); }
@@ -68,6 +79,19 @@ class AI10SnapshotCamera : public camera::Camera {
   std::shared_ptr<SnapshotImage> image_;
   std::vector<camera::CameraListener *> listeners_;
   bool capturing_{false}, requested_{false}, last_capture_succeeded_{false};
+  enum Phase : uint8_t { IDLE, QUEUED, WAIT_STOP, FACE, WAIT_FALLBACK, FULL, RESTART, WAIT_RESTART };
+  Phase phase_{IDLE};
+  uint8_t failure_threshold_{3}, failure_count_{0}, resume_timeout_{30};
+  int16_t resume_attempts_{-1};
+  bool auto_enabled_{false}, fallback_snapshot_{true}, archive_in_flight_{false}, archive_attempted_{false};
+  uint32_t phase_started_{0}, retry_ms_{60000}, archive_last_attempt_{0};
+  uint32_t archive_sequence_{0};
+  std::string archive_status_{"No pending image"};
+  CallbackManager<void(std::string)> archive_request_;
+  void set_phase_(Phase phase);
+  void auto_capture_loop_();
+  void archive_loop_();
+  void finish_auto_capture_();
   uint8_t capture_cmd_{0x71};
   std::string archive_token_;
   bool take_snapshot_(uint8_t command);
@@ -77,6 +101,13 @@ class AI10SnapshotCamera : public camera::Camera {
   bool accept_chunk_(const uint8_t *data, size_t len);
   void complete_(uint8_t result);
   void fail_(const char *reason);
+};
+
+class ArchiveRequestTrigger : public Trigger<std::string> {
+ public:
+  explicit ArchiveRequestTrigger(AI10SnapshotCamera *parent) {
+    parent->add_on_archive_request_callback([this](std::string token) { this->trigger(token); });
+  }
 };
 
 }

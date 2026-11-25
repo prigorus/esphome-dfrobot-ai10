@@ -27,3 +27,7 @@ jobs:
           sed "s/BOARD_NAME/${{ matrix.board }}/g" tests/compile.yaml.in > ci.yaml
           esphome config ci.yaml
           esphome compile ci.yaml
+      - run: |
+          sed "s/BOARD_NAME/${{ matrix.board }}/g" tests/package.yaml.in > package-ci.yaml
+          esphome config package-ci.yaml
+          esphome compile package-ci.yaml
