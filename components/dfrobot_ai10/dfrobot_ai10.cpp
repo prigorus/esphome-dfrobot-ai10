@@ -25,69 +25,17 @@ void DFRobotAI10Component::dump_config() {
 }
 
 void DFRobotAI10Component::loop() {
-  // Read bytes one-by-one and feed into state machine parser
-  uint32_t now = millis();
-  if (parser_state_ != STATE_WAIT_SYNC_H && now - last_byte_ > 250)
-    parser_state_ = STATE_WAIT_SYNC_H;
-  for (size_t budget = 0; budget < 2048 && this->available(); ++budget) {
+  uint32_t now=millis();
+  if (!parser_.idle() && now-last_byte_>250) parser_.reset();
+  for (size_t budget=0;budget<2048 && available();++budget) {
     uint8_t byte;
-    if (!this->read_byte(&byte)) break;
-    last_byte_ = millis();
-
-    switch (this->parser_state_) {
-      case STATE_WAIT_SYNC_H:
-        if (byte == SYNC_H) {
-          this->parser_state_ = STATE_WAIT_SYNC_L;
-        }
-        break;
-
-      case STATE_WAIT_SYNC_L:
-        if (byte == SYNC_L) {
-          this->parser_state_ = STATE_READ_HEADER;
-          this->header_pos_ = 0;
-        } else if (byte == SYNC_H) {
-          // Another 0xEF — stay in WAIT_SYNC_L
-        } else {
-          this->parser_state_ = STATE_WAIT_SYNC_H;
-        }
-        break;
-
-      case STATE_READ_HEADER:
-        this->header_buf_[this->header_pos_++] = byte;
-        if (this->header_pos_ >= 3) {
-          // Header complete: msg_id(1) + lenH(1) + lenL(1)
-          this->payload_len_ = (this->header_buf_[1] << 8) | this->header_buf_[2];
-          this->payload_pos_ = 0;
-
-          if (this->payload_len_ >= sizeof(this->payload_buf_)) {
-            ESP_LOGW(TAG, "Payload too large: %d bytes, resetting parser", this->payload_len_);
-            this->parser_state_ = STATE_WAIT_SYNC_H;
-          } else {
-            this->parser_state_ = STATE_READ_PAYLOAD;
-          }
-        }
-        break;
-
-      case STATE_READ_PAYLOAD:
-        this->payload_buf_[this->payload_pos_++] = byte;
-        if (this->payload_pos_ >= this->payload_len_ + 1) {
-          // Packet complete — verify XOR checksum
-          uint8_t xor_calc = 0;
-          for (uint8_t i = 0; i < 3; i++) xor_calc ^= this->header_buf_[i];
-          for (uint16_t i = 0; i < this->payload_len_; i++) xor_calc ^= this->payload_buf_[i];
-
-          uint8_t xor_recv = this->payload_buf_[this->payload_len_];
-
-          if (xor_calc == xor_recv) {
-            uint8_t msg_id = this->header_buf_[0];
-            // ESP_LOGV(TAG, "Packet received: MsgID=0x%02X, Len=%d, XOR OK", msg_id, this->payload_len_);
-            this->process_packet_(msg_id, this->payload_buf_, this->payload_len_);
-          } else {
-            ESP_LOGW(TAG, "XOR checksum mismatch! calc=0x%02X recv=0x%02X", xor_calc, xor_recv);
-          }
-          this->parser_state_ = STATE_WAIT_SYNC_H;
-        }
-        break;
+    if (!read_byte(&byte)) break;
+    last_byte_=millis();
+    switch(parser_.feed(byte)) {
+      case FrameParser::FRAME: process_packet_(parser_.id(),parser_.data(),parser_.length()); break;
+      case FrameParser::BAD_XOR: ESP_LOGW(TAG,"UART checksum mismatch"); break;
+      case FrameParser::TOO_LARGE: ESP_LOGW(TAG,"UART payload exceeds buffer"); break;
+      default: break;
     }
   }
 
@@ -99,15 +47,21 @@ void DFRobotAI10Component::loop() {
   }
   if (config_test_phase_ == 3 && now - config_test_hold_started_ >= 80) {
     config_test_phase_ = 4;
-    command_started_ = now; command_timeout_ms_ = 3000;
+    config_test_hold_started_=now;
+    command_started_=now; command_timeout_ms_=3000;
     send_extended_packet_(0xF9, {3});
   }
+  if (config_test_phase_==4 && now-config_test_hold_started_>=150) {
+    ESP_LOGI(TAG,"LED test transmitted; physical effect unconfirmed");
+    finish_config_test_(0xF9,0xFF);
+  }
+  if (recovery_pending_ && now-recovery_at_ >= 1500) run_recovery_();
   if (refresh_queued_ && setup_done_ && !waiting_reset_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
     refresh_queued_ = false;
     refresh_users();
   }
   if (repeat_wait_ && !waiting_reset_ && pending_cmd_ == CMD_VERIFY &&
-      stored_continuous_ && !suppress_verify_ && now - repeat_started_ >= 1000) {
+      stored_continuous_ && !suppress_verify_ && now - repeat_started_ >= repeat_delay_ms_) {
     repeat_wait_ = false;
     pending_action_ = PENDING_VERIFY;
     execute_pending_action_();
@@ -115,7 +69,7 @@ void DFRobotAI10Component::loop() {
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
     this->last_status_log_ = now;
     ESP_LOGD(TAG, "Parser state: %s, last result: %s",
-             this->parser_state_ == STATE_WAIT_SYNC_H ? "IDLE" : "RECEIVING",
+             parser_.idle() ? "IDLE" : "RECEIVING",
              result_to_str_(this->last_result_));
   }
 }
@@ -134,23 +88,53 @@ void DFRobotAI10Component::cancel_stop_() {
   cancel_timeout("ai10_stop_final");
   stop_in_progress_ = false;
 }
+void DFRobotAI10Component::cancel_recovery_() {
+  recovery_pending_=false; recovery_check_=false; recovery_count_=0;
+}
+void DFRobotAI10Component::schedule_recovery_(uint8_t timeout,int16_t attempts) {
+  if (!recovery_enabled_ || !timeout || stop_in_progress_) return;
+  if (recovery_count_>=3) {
+    ESP_LOGE(TAG,"Recognition recovery exhausted; start manually");
+    recovery_pending_=false; recovery_check_=false; return;
+  }
+  recovery_timeout_=timeout; recovery_attempts_=attempts;
+  recovery_pending_=true; recovery_check_=false; recovery_at_=millis();
+  ESP_LOGW(TAG,"Recognition recovery scheduled (%u/3)",unsigned(recovery_count_+1));
+}
+void DFRobotAI10Component::run_recovery_() {
+  if (!recovery_pending_ || waiting_reset_ || pending_cmd_ || stop_in_progress_) return;
+  recovery_pending_=false;
+  ++recovery_count_;
+  recovery_check_=true;
+  suppress_verify_=true; invalidate_auth_();
+  pending_action_=PENDING_EXTENDED;
+  extended_cmd_=CMD_STATUS; extended_data_.clear(); extended_timeout_ms_=3000;
+  transmit_reset_();
+}
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
-  repeat_wait_ = false;
-  if (config_test_phase_) {
-    ESP_LOGW(TAG, "AI10 test interrupted: cmd=0x%02X result=0x%02X; no automatic restart after transport failure", cmd, result);
+  repeat_wait_=false;
+  const bool failed_directory=directory_active_;
+  const bool enroll=enrollment_command_(cmd) || (cmd==CMD_RESET && (pending_action_==PENDING_ENROLL ||
+      (pending_action_==PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
+  const bool verify=cmd==CMD_VERIFY || (cmd==CMD_RESET && pending_action_==PENDING_VERIFY);
+  // Only restore a previously active continuous session. Never retry the failed operation.
+  const bool restore=recovery_check_ || (verify && stored_continuous_) || resume_pending_ || config_test_resume_;
+  const uint8_t timeout=recovery_check_?recovery_timeout_:(config_test_resume_?config_test_timeout_:(resume_pending_?resume_timeout_:stored_timeout_));
+  const int16_t attempts=recovery_check_?recovery_attempts_:(config_test_resume_?config_test_attempts_:(resume_pending_?resume_attempts_:max_attempts_));
+  if(config_test_phase_) {
+    ESP_LOGW(TAG,"AI10 test interrupted: cmd=0x%02X result=0x%02X",cmd,result);
     cancel_config_test_();
   }
-  bool failed_directory = directory_active_;
   cancel_directory_();
-  bool enroll = enrollment_command_(cmd) || (cmd == CMD_RESET && (pending_action_ == PENDING_ENROLL || (pending_action_ == PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
-  bool verify = cmd == CMD_VERIFY || (cmd == CMD_RESET && pending_action_ == PENDING_VERIFY);
-  waiting_reset_ = false; pending_action_ = PENDING_NONE; pending_cmd_ = 0;
+  waiting_reset_=false; pending_action_=PENDING_NONE; pending_cmd_=0;
+  recovery_check_=false; reset_confirmed_idle_=false;
   clear_transfer_();
-  suppress_verify_ = true; invalidate_auth_(); last_result_ = result;
-  if (enroll) enrollment_failed_.call(result);
-  if (verify) recognition_failed_.call(result);
-  if (failed_directory) user_directory_failed_.call(result);
-  command_result_.call(cmd, result);
+  suppress_verify_=true; invalidate_auth_(); last_result_=result;
+  if(restore) schedule_recovery_(timeout,attempts);
+  if(enroll) enrollment_failed_.call(result);
+  if(verify) recognition_failed_.call(result);
+  if(failed_directory) user_directory_failed_.call(result);
+  command_result_.call(cmd,result);
 }
 void DFRobotAI10Component::transmit_reset_() {
   uint8_t data[] = {CMD_RESET, 0, 0};
@@ -159,6 +143,8 @@ void DFRobotAI10Component::transmit_reset_() {
 }
 void DFRobotAI10Component::send_reset() {
   repeat_wait_ = false;
+  if (config_test_phase_==3) send_extended_packet_(0xF9,{3});
+  cancel_recovery_();
   cancel_config_test_();
   cancel_stop_(); cancel_directory_(); pending_action_ = PENDING_NONE; pending_cmd_ = 0;
   clear_transfer_();
@@ -166,7 +152,7 @@ void DFRobotAI10Component::send_reset() {
   if (setup_done_) transmit_reset_();
 }
 bool DFRobotAI10Component::prepare_(PendingAction action) {
-  if (!setup_done_ || waiting_reset_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || recovery_pending_ || stop_in_progress_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "Module busy or booting; command rejected");
     return false;
   }
@@ -190,18 +176,24 @@ void DFRobotAI10Component::stop_recognition() {
   });
   set_timeout("ai10_stop_final", 1500, [this]() { send_reset(); });
 }
+void DFRobotAI10Component::pause_for_capture() {
+  if (fast_capture_) send_reset();
+  else stop_recognition();
+}
 void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous) {
-  if (!prepare_(PENDING_VERIFY)) return;
+  if (!timeout || !prepare_(PENDING_VERIFY)) return;
+  cancel_recovery_();
   stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = -1;
   transmit_reset_();
 }
 void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous, uint8_t max_attempts) {
-  if (!prepare_(PENDING_VERIFY)) return;
+  if (!timeout || !prepare_(PENDING_VERIFY)) return;
+  cancel_recovery_();
   stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = max_attempts;
   transmit_reset_();
 }
 void DFRobotAI10Component::enroll_user(uint8_t admin, const char *name, uint8_t timeout) {
-  if (!name || !prepare_(PENDING_ENROLL)) return;
+  if (!name || !*name || strlen(name)>31 || admin>1 || !timeout || !prepare_(PENDING_ENROLL)) return;
   stored_admin_ = admin; stored_name_ = name; stored_timeout_ = timeout;
   stored_enroll_direction_ = 0x00;
   transmit_reset_();
@@ -218,7 +210,7 @@ void DFRobotAI10Component::enroll_palm(uint8_t admin, const char *name, uint8_t 
   transmit_reset_();
 }
 void DFRobotAI10Component::delete_user(uint16_t uid) {
-  if (!prepare_(PENDING_DELETE_USER)) return;
+  if (uid<1 || uid>2000 || !prepare_(PENDING_DELETE_USER)) return;
   stored_uid_ = uid; transmit_reset_();
 }
 void DFRobotAI10Component::delete_all_users() {
@@ -242,9 +234,32 @@ void DFRobotAI10Component::cancel_directory_() {
     user_list_complete_ = false; user_ids_.clear(); user_count_ = 0;
   }
   directory_active_ = false;
+  directory_delta_uid_=0;
   refresh_queued_ = false;
   resume_pending_ = false;
   staged_users_.clear();
+}
+bool DFRobotAI10Component::update_deleted_cache_(bool all) {
+  if (!incremental_directory_ || !auto_refresh_users_ || !directory_complete_ || !user_list_complete_) return false;
+  if (all) { users_.clear(); user_ids_.clear(); }
+  else {
+    auto it=std::find(user_ids_.begin(),user_ids_.end(),stored_uid_);
+    if(it==user_ids_.end()) return false;
+    user_ids_.erase(it);
+    users_.erase(std::remove_if(users_.begin(),users_.end(),[this](const UserRecord &u){return u.uid==stored_uid_;}),users_.end());
+  }
+  user_count_=uint16_t(user_ids_.size());
+  return true;
+}
+bool DFRobotAI10Component::begin_enrolled_cache_update_(uint16_t uid) {
+  if (!incremental_directory_ || !auto_refresh_users_ || !directory_complete_ || !user_list_complete_ ||
+      std::find(user_ids_.begin(),user_ids_.end(),uid)!=user_ids_.end() || user_ids_.size()>=2000) return false;
+  directory_delta_uid_=uid; directory_active_=true; directory_complete_=false; user_list_complete_=false;
+  staged_users_.swap(users_);
+  extended_data_={uint8_t(uid>>8),uint8_t(uid)};
+  pending_cmd_=CMD_GET_USER_INFO; command_started_=millis(); command_timeout_ms_=3000;
+  send_extended_packet_(pending_cmd_,extended_data_);
+  return true;
 }
 void DFRobotAI10Component::schedule_directory_refresh_() {
   invalidate_directory_();
@@ -253,14 +268,14 @@ void DFRobotAI10Component::schedule_directory_refresh_() {
 }
 void DFRobotAI10Component::refresh_users() {
   // Keep one outstanding request; never overlap user-detail replies.
-  if (!setup_done_ || waiting_reset_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || recovery_pending_ || stop_in_progress_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "User directory refresh rejected: module busy or booting");
     return;
   }
   remember_recognition_();
   directory_active_ = true;
   if (!prepare_(PENDING_GET_USERS)) { cancel_directory_(); return; }
-  refresh_queued_ = false; directory_index_ = 0;
+  refresh_queued_ = false; directory_index_ = 0; directory_delta_uid_=0;
   invalidate_directory_(); staged_users_.clear();
   user_ids_.clear(); user_count_ = 0; user_list_complete_ = false;
   transmit_reset_();
@@ -275,7 +290,7 @@ void DFRobotAI10Component::request_next_user_() {
 }
 void DFRobotAI10Component::finish_directory_() {
   users_.swap(staged_users_); staged_users_.clear();
-  directory_complete_ = true; directory_active_ = false; pending_cmd_ = 0;
+  directory_complete_ = true; directory_active_ = false; directory_delta_uid_=0; pending_cmd_ = 0;
   bool resume = resume_pending_; resume_pending_ = false;
   uint8_t timeout = resume_timeout_;
   int16_t attempts = resume_attempts_;
@@ -343,11 +358,14 @@ void DFRobotAI10Component::finish_config_test_(uint8_t cmd, uint8_t result) {
   cancel_config_test_();
   pending_cmd_ = 0; last_result_ = result;
   command_result_.call(cmd,result);
-  // Only resume after a matched reply, never after missing/corrupt replies.
-  if (resume && !is_busy() && !stop_in_progress_) start_configured_recognition(timeout,true,attempts);
+  // The LED command has no confirmed reply; verify liveness via reset/status before resuming.
+  if (resume && !is_busy() && !stop_in_progress_) {
+    if (cmd==0xF9 && recovery_enabled_) schedule_recovery_(timeout,attempts);
+    else start_configured_recognition(timeout,true,attempts);
+  }
 }
 void DFRobotAI10Component::test_white_led() { queue_config_test_(0xF9,{2},2); }
-void DFRobotAI10Component::test_white_led_off() { queue_config_test_(0xF9,{3}); }
+void DFRobotAI10Component::test_white_led_off() { queue_config_test_(0xF9,{3},5); }
 void DFRobotAI10Component::test_auto_light(int state) {
   if (state == -1) queue_config_test_(0xDB,{});
   else if (state == 0 || state == 1) queue_config_test_(0xDB,{uint8_t(state)});
@@ -406,7 +424,9 @@ bool DFRobotAI10Component::capture_image(uint8_t kind, uint8_t resolution, Chunk
   transfer_sink_ = std::move(sink); transfer_size_ = transfer_received_ = 0; transfer_seq_ = 0; capture_uid_ = 0;
   extended_cmd_ = kind; extended_data_ = {0};
   if (kind == 0x74) extended_data_.push_back(resolution);
-  extended_timeout_ms_ = std::max<uint32_t>(1000, first_reply_timeout_ms); transmit_reset_();
+  extended_timeout_ms_ = std::max<uint32_t>(1000, first_reply_timeout_ms);
+  if (fast_capture_ && reset_confirmed_idle_) execute_pending_action_();
+  else transmit_reset_();
   return true;
 }
 void DFRobotAI10Component::export_template(uint16_t uid, uint8_t type, ChunkSink sink) {
@@ -550,6 +570,10 @@ void DFRobotAI10Component::execute_pending_action_() {
       packet.insert(packet.end(), extended_data_.begin(), extended_data_.end());
       pending_cmd_ = extended_cmd_; command_timeout_ms_ = extended_timeout_ms_;
       send_packet_(packet.data(), packet.size());
+      if(config_test_phase_==2 || config_test_phase_==5) {
+        config_test_phase_=config_test_phase_==2?3:4;
+        config_test_hold_started_=millis();
+      }
       break;
     }
     default:
@@ -563,7 +587,8 @@ void DFRobotAI10Component::execute_pending_action_() {
 // ===== Protocol Implementation =====
 
 void DFRobotAI10Component::send_packet_(const uint8_t *data, size_t len) {
-  uint8_t xor_check = xor_checksum_(data, len);
+  reset_confirmed_idle_=false;
+  uint8_t xor_check = frame_xor(data, len);
 
   // Wire format: [SYNC_H][SYNC_L][data...][XOR]
   uint8_t sync[2] = {SYNC_H, SYNC_L};
@@ -584,11 +609,7 @@ void DFRobotAI10Component::send_packet_(const uint8_t *data, size_t len) {
 }
 
 uint8_t DFRobotAI10Component::xor_checksum_(const uint8_t *data, size_t len) {
-  uint8_t xor_val = 0;
-  for (size_t i = 0; i < len; i++) {
-    xor_val ^= data[i];
-  }
-  return xor_val;
+  return frame_xor(data,len);
 }
 
 void DFRobotAI10Component::process_packet_(uint8_t msg_id, const uint8_t *payload, uint16_t len) {
@@ -609,7 +630,7 @@ void DFRobotAI10Component::schedule_repeat_() {
   // Ignore late replies/notes between single-shot cycles.
   repeat_wait_ = true;
   repeat_started_ = command_started_ = millis();
-  command_timeout_ms_ = 4000;
+  command_timeout_ms_ = repeat_delay_ms_+3000;
 }
 void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (len < 2) {
@@ -623,13 +644,23 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (cmd == CMD_RESET) {
     if (!waiting_reset_) return;
     if (result != RES_SUCCESS) { fail_command_(cmd, result); return; }
-    waiting_reset_ = false; last_result_ = result;
+    waiting_reset_ = false; reset_confirmed_idle_=true; last_result_ = result;
     execute_pending_action_();
     return;
   }
   if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && (suppress_verify_ || repeat_wait_))) return;
+  if (recovery_check_ && cmd==CMD_STATUS) {
+    if (result!=RES_SUCCESS || n!=1 || data[0]!=0) {
+      fail_command_(cmd,result==RES_SUCCESS?RES_FAILED_INVALID_PARAM:result); return;
+    }
+    recovery_check_=false;
+    stored_timeout_=recovery_timeout_; max_attempts_=recovery_attempts_; stored_continuous_=true;
+    pending_cmd_=0; pending_action_=PENDING_VERIFY;
+    ESP_LOGI(TAG,"Recognition recovery: reset and idle status confirmed");
+    execute_pending_action_();
+    return;
+  }
   if (config_test_phase_) {
-    if (config_test_phase_ == 3) return; // Ignore duplicate replies during the hold.
     ESP_LOGI(TAG, "AI10 test reply: cmd=0x%02X result=0x%02X bytes=%u",cmd,result,unsigned(n));
     if (n && n <= 16) {
       char buf[49] = {};
@@ -641,11 +672,8 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       if (cmd==0xDB) ESP_LOGI(TAG,"Auto light: %s",data[0]?"ON":"OFF");
       else ESP_LOGI(TAG,"UVC: USB=0x%02X bitrate=%u quality=%u attributes=0x%02X",data[0],data[1],data[2],data[3]);
     }
-    if (config_test_phase_ == 2 && result == RES_SUCCESS) {
-      config_test_phase_ = 3;
-      config_test_hold_started_ = command_started_ = millis(); command_timeout_ms_ = 3000;
-      return;
-    }
+    // Always finish the 80-ms pulse even if firmware sends a reply or rejects ON.
+    if (cmd==0xF9 && (config_test_phase_==3 || config_test_phase_==4)) return;
     finish_config_test_(cmd,result);
     return;
   }
@@ -676,14 +704,13 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   bool continuous = cmd == CMD_VERIFY && stored_continuous_;
   if (result != RES_SUCCESS) {
     if (continuous) {
-      if (full_scan_) {
-        // Repeat only normal negative recognition outcomes, not transport/hardware faults.
-        if (result != RES_FAILED_UNKNOWN_USER && result != RES_FAILED_LIVE_CHECK &&
-            result != RES_FAILED_TIMEOUT && result != 0x1A) {
-          fail_command_(cmd,result); return;
-        }
-        schedule_repeat_();
+      // Normal negative results are expected in both recognition modes.
+      if (result != RES_FAILED_UNKNOWN_USER && result != RES_FAILED_LIVE_CHECK &&
+          result != RES_FAILED_TIMEOUT && result != 0x1A) {
+        fail_command_(cmd,result); return;
       }
+      recovery_count_=0;
+      if (full_scan_) schedule_repeat_();
       invalidate_auth_(); last_result_ = result;
       recognition_failed_.call(result); command_result_.call(cmd, result);
     } else fail_command_(cmd, result);
@@ -704,7 +731,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       if (valid) {
         last_uid_ = uid_of(data); last_user_name_ = bounded_string(data+2,32);
         last_admin_ = data[34] != 0; last_type_ = last_uid_ > 1000 ? TYPE_PALM : TYPE_FACE;
-        recognized_ = true; last_result_ = result;
+        recognized_ = true; last_result_ = result; recovery_count_=0;
       }
       break;
     case CMD_SCAN_QR_CODE:
@@ -715,10 +742,24 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     case CMD_ENROLL_DIRECTION:
     case CMD_ENROLL_INTERACTIVE:
       valid = n >= 2 && valid_uid(uid_of(data));
-      if (valid) { last_uid_ = uid_of(data); user_list_complete_ = false; schedule_directory_refresh_(); }
+      if (valid) {
+        last_uid_=uid_of(data);
+        if (begin_enrolled_cache_update_(last_uid_)) {
+          uint16_t uid=last_uid_;
+          enrollment_success_.call(uid); command_result_.call(cmd,result); return;
+        }
+        user_list_complete_=false; schedule_directory_refresh_();
+      }
       break;
     case CMD_DEL_USER:
     case CMD_DEL_ALL_USER:
+      if (update_deleted_cache_(cmd==CMD_DEL_ALL_USER)) {
+        pending_cmd_=0; last_result_=result;
+        bool resume=resume_pending_; resume_pending_=false;
+        if(resume) start_configured_recognition(resume_timeout_,true,resume_attempts_);
+        users_received_.call(user_count_); user_directory_.call(user_count_); command_result_.call(cmd,result);
+        return;
+      }
       user_list_complete_ = false;
       user_ids_.clear(); user_count_ = 0; schedule_directory_refresh_();
       break;
@@ -773,6 +814,17 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   }
   if (directory_active_ && cmd == CMD_GET_USER_INFO) {
     staged_users_.push_back(user_record);
+    if (directory_delta_uid_) {
+      user_ids_.push_back(user_record.uid);
+      std::sort(user_ids_.begin(),user_ids_.end());
+      std::sort(staged_users_.begin(),staged_users_.end(),[](const UserRecord &a,const UserRecord &b){return a.uid<b.uid;});
+      user_count_=uint16_t(user_ids_.size()); user_list_complete_=true;
+      pending_cmd_=CMD_GET_USER_INFO;
+      user_info_.call(user_record.uid,user_record.name,user_record.admin);
+      command_result_.call(cmd,result);
+      if(directory_active_ && pending_cmd_==CMD_GET_USER_INFO) finish_directory_();
+      return;
+    }
     ++directory_index_;
     // Emit the record before completion, so event consumers can assemble a full list.
     // Keep busy through callbacks and honor explicit cancellation.
@@ -791,6 +843,10 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   else if (cmd == CMD_GET_USER_INFO) user_info_.call(user_record.uid,user_record.name,user_record.admin);
   else if (cmd == CMD_GET_ALL_USERID && !more) users_received_.call(user_count_);
   if (cmd != CMD_GET_ALL_USERID || !more) command_result_.call(cmd,result);
+  if (!pending_cmd_ && !waiting_reset_ && !refresh_queued_ && resume_pending_) {
+    bool resume=resume_pending_; resume_pending_=false;
+    if(resume) start_configured_recognition(resume_timeout_,true,resume_attempts_);
+  }
 }
 
 void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {

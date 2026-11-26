@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <functional>
 #include "ai10_users.h"
+#include "ai10_frame.h"
 
 namespace esphome {
 namespace dfrobot_ai10 {
@@ -128,6 +129,11 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void test_write_uvc(int usb, int bitrate, int quality, int attributes);
   void test_ir_uvc(bool enabled);
   void set_full_scan(bool value) { full_scan_ = value; }
+  void set_repeat_delay(uint32_t ms) { repeat_delay_ms_ = ms; }
+  void set_recovery_enabled(bool value) { recovery_enabled_ = value; }
+  void set_fast_capture(bool value) { fast_capture_ = value; }
+  void pause_for_capture();
+  void set_incremental_directory(bool value) { incremental_directory_ = value; }
   void delete_user(uint16_t uid);
   void delete_all_users();
   void get_all_user_ids();
@@ -176,7 +182,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   const std::vector<uint16_t> &get_user_ids() const { return user_ids_; }
   bool is_user_list_complete() const { return user_list_complete_; }
   bool get_last_admin() const { return last_admin_; }
-  bool is_busy() const { return waiting_reset_ || pending_cmd_ != 0; }
+  bool is_busy() const { return waiting_reset_ || pending_cmd_ != 0 || recovery_pending_; }
   void add_on_enrollment_success_callback(std::function<void(uint16_t)> &&cb) { enrollment_success_.add(std::move(cb)); }
   void add_on_enrollment_failed_callback(std::function<void(uint8_t)> &&cb) { enrollment_failed_.add(std::move(cb)); }
   void add_on_recognition_failed_callback(std::function<void(uint8_t)> &&cb) { recognition_failed_.add(std::move(cb)); }
@@ -212,12 +218,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void execute_pending_action_();
 
   // Parser vars
-  ParserState parser_state_{STATE_WAIT_SYNC_H};
-  uint8_t header_buf_[3];
-  uint8_t header_pos_{0};
-  uint8_t payload_buf_[1030];
-  uint16_t payload_len_{0};
-  uint16_t payload_pos_{0};
+  FrameParser parser_;
 
   // State vars
   uint16_t last_uid_{0};
@@ -288,11 +289,23 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   uint8_t stored_timeout_{0};
   bool stored_continuous_{false};
   bool full_scan_{false}, repeat_wait_{false};
-  uint32_t repeat_started_{0};
+  uint32_t repeat_started_{0}, repeat_delay_ms_{1000};
+  bool recovery_enabled_{false}, recovery_pending_{false}, recovery_check_{false};
+  uint8_t recovery_count_{0}, recovery_timeout_{30};
+  int16_t recovery_attempts_{-1};
+  uint32_t recovery_at_{0};
+  void schedule_recovery_(uint8_t timeout, int16_t attempts);
+  void cancel_recovery_();
+  void run_recovery_();
+  bool fast_capture_{false}, reset_confirmed_idle_{false};
+  bool incremental_directory_{false};
+  bool update_deleted_cache_(bool all);
+  bool begin_enrolled_cache_update_(uint16_t uid);
+  uint16_t directory_delta_uid_{0};
   void schedule_repeat_();
   uint8_t stored_admin_{0};
   uint8_t stored_enroll_direction_{0};
-  // 1=ordinary test, 2=LED ON, 3=hold, 4=LED OFF.
+  // 1=reply expected, 2=LED pulse queued, 3=hold, 4=quiet after OFF, 5=LED OFF queued.
   uint8_t config_test_phase_{0};
   bool config_test_resume_{false};
   uint8_t config_test_timeout_{0};

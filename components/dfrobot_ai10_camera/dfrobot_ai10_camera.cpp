@@ -30,7 +30,9 @@ void AI10SnapshotCamera::setup() {
   });
 }
 void AI10SnapshotCamera::dump_config() {
-  ESP_LOGCONFIG(TAG,"AI10 UART still camera (240x320 / 320x320 face), max JPEG bytes: %u",unsigned(max_bytes_));
+  static const char *const resolutions[]={"240x320","480x640","600x800","1200x1600"};
+  ESP_LOGCONFIG(TAG,"AI10 UART still camera (%s / 320x320 face), max JPEG bytes: %u",
+    resolutions[std::min<unsigned>(snapshot_resolution_,3)],unsigned(max_bytes_));
 }
 bool AI10SnapshotCamera::take_snapshot() { return request_manual_snapshot_(full_snapshot_command_()); }
 bool AI10SnapshotCamera::take_face_snapshot() { return request_manual_snapshot_(0x72); }
@@ -59,7 +61,7 @@ void AI10SnapshotCamera::begin_capture_cycle_(uint8_t command, bool archive, boo
     resume_timeout_=parent_->get_recognition_timeout();
     resume_attempts_=parent_->get_recognition_max_attempts();
     status_="Pausing recognition";
-    parent_->stop_recognition();
+    parent_->pause_for_capture();
   } else {
     status_="Waiting for capture";
   }
@@ -229,8 +231,7 @@ void AI10SnapshotCamera::auto_capture_loop_() {
       break;
     case RESTART:
       if (parent_->can_capture_snapshot()) {
-        if (resume_attempts_<0) parent_->start_recognition(resume_timeout_,true);
-        else parent_->start_recognition(resume_timeout_,true,uint8_t(resume_attempts_));
+        parent_->start_configured_recognition(resume_timeout_,true,resume_attempts_);
         ++restart_attempts_;
         set_phase_(WAIT_RESTART);
       } else if (elapsed>8000) {

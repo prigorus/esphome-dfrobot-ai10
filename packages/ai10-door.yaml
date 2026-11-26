@@ -9,6 +9,10 @@ substitutions:
   ai10_timeout: "30"
   ai10_max_recognition_attempts: "-1" # -1 = firmware default; 0..255 sends third byte
   ai10_recognition_mode: "eco"
+  ai10_repeat_delay_ms: "1000"
+  ai10_recognition_recovery: "true"
+  ai10_fast_capture: "false"
+  ai10_incremental_directory: "false"
   ai10_snapshot_resolution: "240x320"
   ai10_max_image_bytes: "49152"
 
@@ -36,6 +40,10 @@ dfrobot_ai10:
   resume_recognition_after_refresh: true
   documented_qr: false
   recognition_mode: ${ai10_recognition_mode}
+  repeat_delay_ms: ${ai10_repeat_delay_ms}
+  recognition_recovery: ${ai10_recognition_recovery}
+  fast_capture: ${ai10_fast_capture}
+  incremental_directory: ${ai10_incremental_directory}
   allow_sensitive_transfers: true
   on_recognized:
     then:
@@ -282,12 +290,14 @@ button:
   - platform: template
     name: "AI10 TEST samodejna osvetlitev vklop"
     entity_category: diagnostic
+    disabled_by_default: true
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_auto_light(1);
   - platform: template
     name: "AI10 TEST samodejna osvetlitev izklop"
     entity_category: diagnostic
+    disabled_by_default: true
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_auto_light(0);
@@ -300,12 +310,14 @@ button:
   - platform: template
     name: "AI10 TEST IR UVC vklop"
     entity_category: diagnostic
+    disabled_by_default: true
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_ir_uvc(true);
   - platform: template
     name: "AI10 TEST IR UVC izklop"
     entity_category: diagnostic
+    disabled_by_default: true
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_ir_uvc(false);
