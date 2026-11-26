@@ -92,6 +92,9 @@ class AI10SnapshotCamera : public camera::Camera {
   void begin_capture_cycle_(uint8_t command, bool archive, bool resume);
   uint32_t phase_started_{0}, retry_ms_{60000}, archive_last_attempt_{0};
   uint32_t archive_sequence_{0};
+  uint8_t archive_failures_{0};
+  uint32_t archive_retry_delay_() const;
+  void archive_failed_(const char *reason);
   std::string archive_status_{"No pending image"};
   CallbackManager<void(std::string)> archive_request_;
   void set_phase_(Phase phase);

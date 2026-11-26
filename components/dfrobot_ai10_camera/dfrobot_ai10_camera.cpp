@@ -70,12 +70,12 @@ void AI10SnapshotCamera::begin_capture_cycle_(uint8_t command, bool archive, boo
 bool AI10SnapshotCamera::hold_for_archive(const std::string &token) {
   if (token.empty() || capturing_ || !image_ || !last_capture_succeeded_ || has_pending_archive()) return false;
   archive_token_=token;
-  archive_attempted_=false; archive_in_flight_=false; archive_status_="Awaiting archive";
+  archive_attempted_=false; archive_in_flight_=false; archive_failures_=0; archive_status_="Awaiting archive";
   return true;
 }
 bool AI10SnapshotCamera::acknowledge_archive(const std::string &token) {
   if (token.empty() || token!=archive_token_) return false;
-  archive_token_.clear(); archive_in_flight_=false; archive_status_="Saved";
+  archive_token_.clear(); archive_in_flight_=false; archive_failures_=0; archive_status_="Saved";
   return true;
 }
 bool AI10SnapshotCamera::take_snapshot_(uint8_t command) {
@@ -258,17 +258,27 @@ void AI10SnapshotCamera::auto_capture_loop_() {
 void AI10SnapshotCamera::archive_result(const std::string &token, bool success) {
   if (token.empty() || token!=archive_token_) return;
   if (success) { acknowledge_archive(token); ESP_LOGI(TAG,"Archive saved"); }
-  else { archive_in_flight_=false; archive_status_="Write failed; retry scheduled"; }
+  else archive_failed_("Write failed; retry scheduled");
+}
+uint32_t AI10SnapshotCamera::archive_retry_delay_() const {
+  // First retry at the configured interval; back off on repeated failures.
+  const unsigned shift=archive_failures_>0?std::min<unsigned>(archive_failures_-1,4):0;
+  const uint64_t delay=uint64_t(retry_ms_)<<shift;
+  return uint32_t(std::min<uint64_t>(delay,std::max<uint32_t>(retry_ms_,900000)));
+}
+void AI10SnapshotCamera::archive_failed_(const char *reason) {
+  archive_in_flight_=false;
+  if(archive_failures_<5) ++archive_failures_;
+  archive_status_=reason;
 }
 void AI10SnapshotCamera::archive_loop_() {
   if (!has_pending_archive()) return;
   uint32_t now=millis();
   if (archive_in_flight_) {
     if (now-archive_last_attempt_<std::max<uint32_t>(retry_ms_,120000)) return;
-    archive_in_flight_=false;
-    archive_status_="Write acknowledgement timed out";
+    archive_failed_("Write acknowledgement timed out");
   }
-  if (archive_attempted_ && now-archive_last_attempt_<retry_ms_) return;
+  if (archive_attempted_ && now-archive_last_attempt_<archive_retry_delay_()) return;
   archive_attempted_=true; archive_in_flight_=true; archive_last_attempt_=now;
   archive_status_="Saving to Home Assistant";
   archive_request_.call(archive_token_);

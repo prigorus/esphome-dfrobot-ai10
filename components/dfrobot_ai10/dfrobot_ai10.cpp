@@ -45,6 +45,7 @@ void DFRobotAI10Component::loop() {
     uint8_t cmd = waiting_reset_ ? CMD_RESET : pending_cmd_;
     fail_command_(cmd, RES_FAILED_TIMEOUT);
   }
+  now=millis();
   if (config_test_phase_ == 3 && now - config_test_hold_started_ >= 80) {
     config_test_phase_ = 4;
     config_test_hold_started_=now;
@@ -55,8 +56,9 @@ void DFRobotAI10Component::loop() {
     ESP_LOGI(TAG,"LED test transmitted; physical effect unconfirmed");
     finish_config_test_(0xF9,0xFF);
   }
+  now=millis();
   if (recovery_pending_ && now-recovery_at_ >= 1500) run_recovery_();
-  if (refresh_queued_ && setup_done_ && !waiting_reset_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
+  if (refresh_queued_ && setup_done_ && !waiting_reset_ && !recovery_pending_ && !stop_in_progress_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
     refresh_queued_ = false;
     refresh_users();
   }
@@ -123,7 +125,13 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   const int16_t attempts=recovery_check_?recovery_attempts_:(config_test_resume_?config_test_attempts_:(resume_pending_?resume_attempts_:max_attempts_));
   if(config_test_phase_) {
     ESP_LOGW(TAG,"AI10 test interrupted: cmd=0x%02X result=0x%02X",cmd,result);
+    if(config_test_phase_==3) send_extended_packet_(0xF9,{3});
     cancel_config_test_();
+  }
+  // A timed-out mutation may have reached the device; never present a stale directory as complete.
+  if ((enroll || cmd==CMD_DEL_USER || cmd==CMD_DEL_ALL_USER) &&
+      (result==RES_FAILED_TIMEOUT || result==RES_ABORTED || result==RES_FAILED_INVALID_PARAM)) {
+    invalidate_directory_(); user_list_complete_=false; user_ids_.clear(); user_count_=0;
   }
   cancel_directory_();
   waiting_reset_=false; pending_action_=PENDING_NONE; pending_cmd_=0;
@@ -383,7 +391,7 @@ void DFRobotAI10Component::query_status() { queue_extended_(CMD_STATUS, {}); }
 void DFRobotAI10Component::query_version() { queue_extended_(CMD_VERSION, {}); }
 void DFRobotAI10Component::query_serial() { queue_extended_(CMD_SERIAL, {}); }
 void DFRobotAI10Component::query_user(uint16_t uid) {
-  stored_uid_ = uid;
+  if (uid<1 || uid>2000) return;
   queue_extended_(CMD_GET_USER_INFO, {uint8_t(uid >> 8), uint8_t(uid)});
 }
 void DFRobotAI10Component::clear_enrollment() { queue_extended_(CMD_FACE_RESET, {}); }
@@ -745,6 +753,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       if (valid) {
         last_uid_=uid_of(data);
         if (begin_enrolled_cache_update_(last_uid_)) {
+          last_result_=result;
           uint16_t uid=last_uid_;
           enrollment_success_.call(uid); command_result_.call(cmd,result); return;
         }
