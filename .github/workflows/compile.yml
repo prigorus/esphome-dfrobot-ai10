@@ -12,6 +12,7 @@ jobs:
       - run: g++ -std=c++17 -Wall -Wextra -Werror -I components/dfrobot_ai10 tests/test_users.cpp -o /tmp/ai10-test-users
       - run: /tmp/ai10-test-users
       - run: g++ -std=c++17 -Wall -Wextra -Werror -I components/dfrobot_ai10 tests/test_frame.cpp -o /tmp/ai10-test-frame && /tmp/ai10-test-frame
+      - run: g++ -std=c++17 -Wall -Wextra -Werror -I components/dfrobot_ai10 tests/test_directional.cpp -o /tmp/ai10-test-directional && /tmp/ai10-test-directional
   compile:
     runs-on: ubuntu-latest
     strategy:

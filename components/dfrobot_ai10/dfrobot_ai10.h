@@ -19,6 +19,7 @@
 #include <functional>
 #include "ai10_users.h"
 #include "ai10_frame.h"
+#include "ai10_directional_enrollment.h"
 
 namespace esphome {
 namespace dfrobot_ai10 {
@@ -121,6 +122,10 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void start_recognition(uint8_t timeout, bool continuous);
   void start_configured_recognition(uint8_t timeout, bool continuous, int attempts);
   void enroll_palm(uint8_t admin, const char *name, uint8_t timeout);
+  bool enroll_face_directions(uint8_t admin, const char *name, uint8_t timeout=25);
+  void add_on_directional_enrollment_callback(std::function<void(uint8_t,uint8_t,uint16_t,uint8_t)> &&cb) {
+    directional_enrollment_.add(std::move(cb));
+  }
   // Explicitly invoked hardware experiments; no test runs automatically.
   void test_white_led();
   void test_white_led_off();
@@ -182,7 +187,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   const std::vector<uint16_t> &get_user_ids() const { return user_ids_; }
   bool is_user_list_complete() const { return user_list_complete_; }
   bool get_last_admin() const { return last_admin_; }
-  bool is_busy() const { return waiting_reset_ || pending_cmd_ != 0 || recovery_pending_; }
+  bool is_busy() const { return waiting_reset_ || pending_cmd_ != 0 || recovery_pending_ || guided_active_; }
   void add_on_enrollment_success_callback(std::function<void(uint16_t)> &&cb) { enrollment_success_.add(std::move(cb)); }
   void add_on_enrollment_failed_callback(std::function<void(uint8_t)> &&cb) { enrollment_failed_.add(std::move(cb)); }
   void add_on_recognition_failed_callback(std::function<void(uint8_t)> &&cb) { recognition_failed_.add(std::move(cb)); }
@@ -305,6 +310,14 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void schedule_repeat_();
   uint8_t stored_admin_{0};
   uint8_t stored_enroll_direction_{0};
+  DirectionalEnrollment guided_;
+  bool guided_active_{false}, guided_wait_{false};
+  uint8_t guided_timeout_{25};
+  uint32_t guided_next_at_{0};
+  CallbackManager<void(uint8_t,uint8_t,uint16_t,uint8_t)> directional_enrollment_;
+  void send_guided_direction_();
+  void handle_guided_reply_(uint8_t result,const uint8_t *data,uint16_t n);
+  void invalidate_guided_directory_();
   // 1=reply expected, 2=LED pulse queued, 3=hold, 4=quiet after OFF, 5=LED OFF queued.
   uint8_t config_test_phase_{0};
   bool config_test_resume_{false};
@@ -336,6 +349,15 @@ class QRScannedTrigger : public Trigger<std::string> {
   explicit QRScannedTrigger(DFRobotAI10Component *parent) {
     parent->add_on_qr_scanned_callback([this](std::string data) {
       this->trigger(data);
+    });
+  }
+};
+
+class DirectionalEnrollmentTrigger : public Trigger<uint8_t,uint8_t,uint16_t,uint8_t> {
+ public:
+  explicit DirectionalEnrollmentTrigger(DFRobotAI10Component *parent) {
+    parent->add_on_directional_enrollment_callback([this](uint8_t step,uint8_t mask,uint16_t uid,uint8_t result) {
+      this->trigger(step,mask,uid,result);
     });
   }
 };

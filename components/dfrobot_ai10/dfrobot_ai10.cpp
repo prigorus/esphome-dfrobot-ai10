@@ -57,6 +57,8 @@ void DFRobotAI10Component::loop() {
     finish_config_test_(0xF9,0xFF);
   }
   now=millis();
+  if (guided_active_ && guided_wait_ && !waiting_reset_ && pending_cmd_==CMD_ENROLL_DIRECTION &&
+      now-guided_next_at_>=1200) send_guided_direction_();
   if (recovery_pending_ && now-recovery_at_ >= 1500) run_recovery_();
   if (refresh_queued_ && setup_done_ && !waiting_reset_ && !recovery_pending_ && !stop_in_progress_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
     refresh_queued_ = false;
@@ -116,11 +118,13 @@ void DFRobotAI10Component::run_recovery_() {
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   repeat_wait_=false;
   const bool failed_directory=directory_active_;
+  const bool failed_guided=guided_active_;
+  guided_active_=false; guided_wait_=false;
   const bool enroll=enrollment_command_(cmd) || (cmd==CMD_RESET && (pending_action_==PENDING_ENROLL ||
       (pending_action_==PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
   const bool verify=cmd==CMD_VERIFY || (cmd==CMD_RESET && pending_action_==PENDING_VERIFY);
   // Only restore a previously active continuous session. Never retry the failed operation.
-  const bool restore=recovery_check_ || (verify && stored_continuous_) || resume_pending_ || config_test_resume_;
+  const bool restore=!failed_guided && (recovery_check_ || (verify && stored_continuous_) || resume_pending_ || config_test_resume_);
   const uint8_t timeout=recovery_check_?recovery_timeout_:(config_test_resume_?config_test_timeout_:(resume_pending_?resume_timeout_:stored_timeout_));
   const int16_t attempts=recovery_check_?recovery_attempts_:(config_test_resume_?config_test_attempts_:(resume_pending_?resume_attempts_:max_attempts_));
   if(config_test_phase_) {
@@ -133,6 +137,7 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
       (result==RES_FAILED_TIMEOUT || result==RES_ABORTED || result==RES_FAILED_INVALID_PARAM)) {
     invalidate_directory_(); user_list_complete_=false; user_ids_.clear(); user_count_=0;
   }
+  if(failed_guided) invalidate_guided_directory_();
   cancel_directory_();
   waiting_reset_=false; pending_action_=PENDING_NONE; pending_cmd_=0;
   recovery_check_=false; reset_confirmed_idle_=false;
@@ -140,6 +145,10 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   suppress_verify_=true; invalidate_auth_(); last_result_=result;
   if(restore) schedule_recovery_(timeout,attempts);
   if(enroll) enrollment_failed_.call(result);
+  if(failed_guided) {
+    ESP_LOGW(TAG,"Directional enrollment aborted: mask=0x%02X UID=%u result=0x%02X; inspect directory before restarting",guided_.mask,guided_.uid,result);
+    directional_enrollment_.call(0,guided_.mask,guided_.uid,result);
+  }
   if(verify) recognition_failed_.call(result);
   if(failed_directory) user_directory_failed_.call(result);
   command_result_.call(cmd,result);
@@ -150,6 +159,11 @@ void DFRobotAI10Component::transmit_reset_() {
   send_packet_(data, sizeof(data));
 }
 void DFRobotAI10Component::send_reset() {
+  const bool cancelled_guided=guided_active_;
+  if(cancelled_guided) {
+    guided_active_=false; guided_wait_=false;
+    invalidate_guided_directory_();
+  }
   repeat_wait_ = false;
   if (config_test_phase_==3) send_extended_packet_(0xF9,{3});
   cancel_recovery_();
@@ -158,9 +172,10 @@ void DFRobotAI10Component::send_reset() {
   clear_transfer_();
   suppress_verify_ = true; invalidate_auth_();
   if (setup_done_) transmit_reset_();
+  if(cancelled_guided) directional_enrollment_.call(0,guided_.mask,guided_.uid,RES_ABORTED);
 }
 bool DFRobotAI10Component::prepare_(PendingAction action) {
-  if (!setup_done_ || waiting_reset_ || recovery_pending_ || stop_in_progress_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_pending_ || stop_in_progress_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "Module busy or booting; command rejected");
     return false;
   }
@@ -276,7 +291,7 @@ void DFRobotAI10Component::schedule_directory_refresh_() {
 }
 void DFRobotAI10Component::refresh_users() {
   // Keep one outstanding request; never overlap user-detail replies.
-  if (!setup_done_ || waiting_reset_ || recovery_pending_ || stop_in_progress_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_pending_ || stop_in_progress_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "User directory refresh rejected: module busy or booting");
     return;
   }
@@ -395,6 +410,61 @@ void DFRobotAI10Component::query_user(uint16_t uid) {
   queue_extended_(CMD_GET_USER_INFO, {uint8_t(uid >> 8), uint8_t(uid)});
 }
 void DFRobotAI10Component::clear_enrollment() { queue_extended_(CMD_FACE_RESET, {}); }
+void DFRobotAI10Component::invalidate_guided_directory_() {
+  invalidate_directory_(); user_list_complete_=false; user_ids_.clear(); user_count_=0;
+}
+bool DFRobotAI10Component::enroll_face_directions(uint8_t admin,const char *name,uint8_t timeout) {
+  // A new face only; do not overwrite or extend an existing identity without a verified protocol.
+  if (!name || !*name || strlen(name)>31 || admin>1 || !timeout ||
+      !directory_complete_ || !user_list_complete_ || directory_active_ || refresh_queued_ ||
+      std::any_of(users_.begin(),users_.end(),[name](const UserRecord &u){return !u.is_palm() && u.name==name;})) {
+    ESP_LOGW(TAG,"Directional enrollment requires a complete directory and a new face name");
+    return false;
+  }
+  if(!prepare_(PENDING_EXTENDED)) return false;
+  guided_={}; guided_active_=true; guided_wait_=false; guided_timeout_=timeout;
+  // Suppress stale directory publication during mutations, but retain previous IDs for validation.
+  directory_complete_=false; user_list_complete_=false;
+  extended_cmd_=CMD_ENROLL_DIRECTION; extended_data_.assign(35,0);
+  extended_data_[0]=admin;
+  memcpy(extended_data_.data()+1,name,strlen(name));
+  extended_data_[33]=DirectionalEnrollment::direction(0); extended_data_[34]=timeout;
+  extended_timeout_ms_=uint32_t(timeout)*1000+3000;
+  transmit_reset_();
+  directional_enrollment_.call(1,0,0,RES_SUCCESS);
+  return true;
+}
+void DFRobotAI10Component::send_guided_direction_() {
+  guided_wait_=false;
+  extended_data_[33]=DirectionalEnrollment::direction(guided_.step);
+  command_started_=millis(); command_timeout_ms_=extended_timeout_ms_;
+  // No RESET between directions: the module may retain enrollment context internally.
+  send_extended_packet_(CMD_ENROLL_DIRECTION,extended_data_);
+  ESP_LOGI(TAG,"Directional enrollment step %u/5, direction=0x%02X",unsigned(guided_.step+1),extended_data_[33]);
+}
+void DFRobotAI10Component::handle_guided_reply_(uint8_t result,const uint8_t *data,uint16_t n) {
+  if(guided_wait_) return;
+  if(result!=RES_SUCCESS) { fail_command_(CMD_ENROLL_DIRECTION,result); return; }
+  const uint16_t uid=n>=2?(uint16_t(data[0])<<8|data[1]):0;
+  const bool existing=std::find(user_ids_.begin(),user_ids_.end(),uid)!=user_ids_.end();
+  ESP_LOGI(TAG,"Directional enrollment reply: UID=%u bytes=%u mask=0x%02X",uid,unsigned(n),n>=3?data[2]:0);
+  const auto outcome=guided_.accept(data,n,existing);
+  if(outcome==DirectionalEnrollment::INVALID) {
+    fail_command_(CMD_ENROLL_DIRECTION,RES_FAILED_INVALID_PARAM); return;
+  }
+  if(outcome==DirectionalEnrollment::NEXT) {
+    guided_wait_=true; guided_next_at_=command_started_=millis(); command_timeout_ms_=4200;
+    directional_enrollment_.call(guided_.step+1,guided_.mask,guided_.uid,RES_SUCCESS);
+    return;
+  }
+  guided_active_=false; guided_wait_=false; pending_cmd_=0;
+  last_result_=RES_SUCCESS; last_uid_=guided_.uid;
+  invalidate_guided_directory_();
+  schedule_directory_refresh_();
+  enrollment_success_.call(guided_.uid);
+  directional_enrollment_.call(6,guided_.mask,guided_.uid,RES_SUCCESS);
+  command_result_.call(CMD_ENROLL_DIRECTION,RES_SUCCESS);
+}
 void DFRobotAI10Component::enroll_direction(uint8_t admin, const char *name, uint8_t direction, uint8_t timeout) {
   if (!name || admin > 1 || direction > 31) return;
   std::vector<uint8_t> data(35, 0); data[0] = admin;
@@ -657,6 +727,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     return;
   }
   if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && (suppress_verify_ || repeat_wait_))) return;
+  if (guided_active_ && cmd==CMD_ENROLL_DIRECTION) { handle_guided_reply_(result,data,n); return; }
   if (recovery_check_ && cmd==CMD_STATUS) {
     if (result!=RES_SUCCESS || n!=1 || data[0]!=0) {
       fail_command_(cmd,result==RES_SUCCESS?RES_FAILED_INVALID_PARAM:result); return;

@@ -58,6 +58,21 @@ dfrobot_ai10:
       - script.stop: ai_recognition_pulse
       - lambda: |-
           id(ai_unlock_pulse).publish_state(false);
+  on_directional_enrollment:
+    then:
+      - script.stop: ai_recognition_pulse
+      - lambda: |-
+          id(ai_unlock_pulse).publish_state(false);
+          static const char *const prompts[]={"", "Glejte naravnost", "Obrnite glavo levo", "Obrnite glavo desno", "Poglejte navzgor", "Poglejte navzdol"};
+          if (step>=1 && step<=5) {
+            id(ai_enrollment_result).publish_state("Korak " + std::to_string(step) + "/5: " + prompts[step]);
+          } else if (step==6) {
+            id(ai_enrollment_result).publish_state("Registracija 5/5 uspešna, UID: " + std::to_string(uid));
+          } else {
+            unsigned completed=0;
+            for (unsigned i=0;i<5;++i) if(mask & (1u<<i)) ++completed;
+            id(ai_enrollment_result).publish_state("Prekinjeno " + std::to_string(completed) + "/5, UID: " + std::to_string(uid) + ", napaka: " + std::to_string(result) + ". Preveri seznam; prepoznavanje ustavljeno.");
+          }
   on_enrollment_success:
     then:
       - lambda: |-
@@ -111,6 +126,15 @@ api:
         - lambda: |-
             if (!id(ai10_camera)->is_auto_capture_active() && !user_name.empty() && user_name.size() <= 31)
               id(ai10_sensor)->enroll_user(is_admin, user_name.c_str(), 30);
+    - action: enroll_face_directions
+      variables:
+        user_name: string
+        is_admin: bool
+      then:
+        - lambda: |-
+            if (id(ai10_camera)->is_auto_capture_active()) return;
+            if (!id(ai10_sensor)->enroll_face_directions(is_admin,user_name.c_str(),25))
+              id(ai_enrollment_result).publish_state("Ni mogoče: osveži seznam, izberi novo ime obraza in počakaj, da je senzor prost.");
     - action: enroll_palm
       variables:
         user_name: string
@@ -241,6 +265,15 @@ button:
             return;
           }
           id(ai10_sensor)->enroll_user(id(ai_new_user_admin).state, name.c_str(), 30);
+  - platform: template
+    name: "Registriraj obraz - 5 smeri"
+    icon: mdi:face-recognition
+    on_press:
+      - lambda: |-
+          if (id(ai10_camera)->is_auto_capture_active()) return;
+          const auto &name=id(ai_new_user_name).state;
+          if (!id(ai10_sensor)->enroll_face_directions(id(ai_new_user_admin).state,name.c_str(),25))
+            id(ai_enrollment_result).publish_state("Ni mogoče: osveži seznam, izberi novo ime obraza in počakaj, da je senzor prost.");
   - platform: template
     name: "Registriraj samo dlan"
     on_press:
