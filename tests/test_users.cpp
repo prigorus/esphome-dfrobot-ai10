@@ -15,6 +15,19 @@ int main() {
   assert(!append_uid_page(page,sizeof(page)-1,ids));
   const uint8_t empty[]{0};
   assert(append_uid_page(empty,sizeof(empty),ids) && ids.size()==6);
+  // Multi-page fixture: 20 full pages and a final empty page.
+  std::vector<uint16_t> many;
+  std::array<uint8_t,201> full{};
+  full[0]=100;
+  for (uint16_t p=0;p<20;++p) {
+    for (uint16_t i=0;i<100;++i) {
+      uint16_t uid=p*100+i+1; full[1+2*i]=uid>>8; full[2+2*i]=uid;
+    }
+    assert(append_uid_page(full.data(),full.size(),many));
+  }
+  assert(many.size()==2000 && many.back()==2000);
+  assert(append_uid_page(empty,sizeof(empty),many));
+  assert(!append_uid_page(full.data(),full.size(),many));
   std::array<uint8_t,35> record{};
   record[0]=3; record[1]=0xEF; record[34]=1;
   const char *name="Example palm";

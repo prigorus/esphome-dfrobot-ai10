@@ -7,6 +7,7 @@ substitutions:
   ai10_failure_threshold: "3"
   ai10_fallback: "true"
   ai10_timeout: "30"
+  ai10_max_recognition_attempts: "-1" # -1 = firmware default; 0..255 sends third byte
   ai10_recognition_mode: "eco"
   ai10_snapshot_resolution: "240x320"
   ai10_max_image_bytes: "49152"
@@ -26,7 +27,7 @@ esphome:
           timeout: 25s
       - lambda: |-
           if (!id(ai10_sensor)->is_busy())
-            id(ai10_sensor)->start_recognition(${ai10_timeout}, true);
+            id(ai10_sensor)->start_configured_recognition(${ai10_timeout}, true, ${ai10_max_recognition_attempts});
 
 dfrobot_ai10:
   id: ai10_sensor
@@ -102,6 +103,24 @@ api:
         - lambda: |-
             if (!id(ai10_camera)->is_auto_capture_active() && !user_name.empty() && user_name.size() <= 31)
               id(ai10_sensor)->enroll_user(is_admin, user_name.c_str(), 30);
+    - action: enroll_palm
+      variables:
+        user_name: string
+        is_admin: bool
+      then:
+        - lambda: |-
+            if (!id(ai10_camera)->is_auto_capture_active() && !user_name.empty() && user_name.size() <= 31)
+              id(ai10_sensor)->enroll_palm(is_admin, user_name.c_str(), 30);
+    - action: ai10_test_write_uvc
+      variables:
+        usb: int
+        bitrate: int
+        quality: int
+        attributes: int
+      then:
+        - lambda: |-
+            if (!id(ai10_camera)->is_auto_capture_active())
+              id(ai10_sensor)->test_write_uvc(usb, bitrate, quality, attributes);
     - action: delete_user
       variables:
         uid: int
@@ -116,7 +135,7 @@ api:
       then:
         - lambda: |-
             if (!id(ai10_camera)->is_auto_capture_active() && timeout >= 1 && timeout <= 255)
-              id(ai10_sensor)->start_recognition(uint8_t(timeout), continuous);
+              id(ai10_sensor)->start_configured_recognition(uint8_t(timeout), continuous, ${ai10_max_recognition_attempts});
     - action: refresh_users
       then:
         - lambda: |-
@@ -188,13 +207,13 @@ button:
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active())
-            id(ai10_sensor)->start_recognition(uint8_t(${ai10_timeout}), true);
+            id(ai10_sensor)->start_configured_recognition(uint8_t(${ai10_timeout}), true, ${ai10_max_recognition_attempts});
   - platform: template
     name: "Enkratno prepoznavanje"
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active())
-            id(ai10_sensor)->start_recognition(uint8_t(${ai10_timeout}), false);
+            id(ai10_sensor)->start_configured_recognition(uint8_t(${ai10_timeout}), false, ${ai10_max_recognition_attempts});
   - platform: template
     name: "Ustavi prepoznavanje"
     on_press:
@@ -215,6 +234,17 @@ button:
           }
           id(ai10_sensor)->enroll_user(id(ai_new_user_admin).state, name.c_str(), 30);
   - platform: template
+    name: "Registriraj samo dlan"
+    on_press:
+      - lambda: |-
+          if (id(ai10_camera)->is_auto_capture_active()) return;
+          const auto &name=id(ai_new_user_name).state;
+          if (name.empty() || name.size()>31) {
+            id(ai_enrollment_result).publish_state("Neveljavno ime (1–31 bajtov)");
+            return;
+          }
+          id(ai10_sensor)->enroll_palm(id(ai_new_user_admin).state, name.c_str(), 30);
+  - platform: template
     name: "Izbriši uporabnika z izbranim UID"
     on_press:
       - lambda: |-
@@ -230,6 +260,55 @@ button:
     on_press:
       - lambda: |-
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->scan_qr_code(15);
+
+  - platform: template
+    name: "AI10 TEST bela LED impulz"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_white_led();
+  - platform: template
+    name: "AI10 TEST bela LED izklop"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_white_led_off();
+  - platform: template
+    name: "AI10 TEST samodejna osvetlitev branje"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_auto_light(-1);
+  - platform: template
+    name: "AI10 TEST samodejna osvetlitev vklop"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_auto_light(1);
+  - platform: template
+    name: "AI10 TEST samodejna osvetlitev izklop"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_auto_light(0);
+  - platform: template
+    name: "AI10 TEST UVC branje"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_read_uvc();
+  - platform: template
+    name: "AI10 TEST IR UVC vklop"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_ir_uvc(true);
+  - platform: template
+    name: "AI10 TEST IR UVC izklop"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_ir_uvc(false);
 
 text_sensor:
   - platform: template

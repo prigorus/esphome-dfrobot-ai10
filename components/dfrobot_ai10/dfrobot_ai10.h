@@ -118,6 +118,15 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   // Public API — call these from HA services or buttons
   void enroll_user(uint8_t admin, const char *name, uint8_t timeout);
   void start_recognition(uint8_t timeout, bool continuous);
+  void start_configured_recognition(uint8_t timeout, bool continuous, int attempts);
+  void enroll_palm(uint8_t admin, const char *name, uint8_t timeout);
+  // Explicitly invoked hardware experiments; no test runs automatically.
+  void test_white_led();
+  void test_white_led_off();
+  void test_auto_light(int state);
+  void test_read_uvc();
+  void test_write_uvc(int usb, int bitrate, int quality, int attributes);
+  void test_ir_uvc(bool enabled);
   void set_full_scan(bool value) { full_scan_ = value; }
   void delete_user(uint16_t uid);
   void delete_all_users();
@@ -229,6 +238,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   uint8_t resume_timeout_{0};
   int16_t resume_attempts_{-1};
   size_t directory_index_{0};
+  uint8_t user_page_{0};
   CallbackManager<void(uint16_t)> user_directory_;
   CallbackManager<void(uint8_t)> user_directory_failed_;
   void remember_recognition_();
@@ -281,6 +291,16 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   uint32_t repeat_started_{0};
   void schedule_repeat_();
   uint8_t stored_admin_{0};
+  uint8_t stored_enroll_direction_{0};
+  // 1=ordinary test, 2=LED ON, 3=hold, 4=LED OFF.
+  uint8_t config_test_phase_{0};
+  bool config_test_resume_{false};
+  uint8_t config_test_timeout_{0};
+  int16_t config_test_attempts_{-1};
+  uint32_t config_test_hold_started_{0};
+  void queue_config_test_(uint8_t cmd, std::vector<uint8_t> data, uint8_t phase=1, bool idle_only=false);
+  void finish_config_test_(uint8_t cmd, uint8_t result);
+  void cancel_config_test_();
   std::string stored_name_;
   uint16_t stored_uid_{0};
   

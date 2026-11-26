@@ -1,0 +1,7 @@
+# Experimental AI-10 controls (develop only)
+
+Firmware support is not yet hardware verified. Commands F9, F4 and F5 are evidenced by the vendor PC tool v1.8.8; DB and B0/B1 by the protocol manual. No changes are sent at boot. Read DB and B0 before any write; record original settings. F9 pulse sends 02, waits for a successful reply, holds 80 ms, then sends 03. If a reply is lost the test aborts and recognition is not automatically resumed; use LED OFF / restart explicitly. IR F4/F5 initialize USB video and require recognition stopped. Use them only with the door secured and verify normal recognition afterwards. No security threshold or duplicate-check changes in this commit because command semantics conflict between sources.
+
+The normal enrollment command retains automatic face/palm selection. The optional palm-only enrollment sends 0xFD. The max-recognition-attempts substitution defaults to -1 (unchanged two-byte verify); 0..255 adds a third byte. User ID pagination sends the next 0x24 request after each 100-entry response, bounded to 2000 users with duplicate checks. No firmware upgrade or biometric export changes.
+
+UVC write is an explicitly invoked API action, not a boot setting. Supply the original USB mode, bitrate and orientation from the read result, changing only quality if testing JPEG. It is not known whether this changes UART JPEG size. Tests pause logical continuous recognition and resume on a matched reply; timeout/malformed transport requires manual recovery. No test generates an authentication callback.
