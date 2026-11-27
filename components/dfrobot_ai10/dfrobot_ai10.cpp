@@ -65,10 +65,17 @@ void DFRobotAI10Component::loop() {
     refresh_users();
   }
   if (repeat_wait_ && !waiting_reset_ && pending_cmd_ == CMD_VERIFY &&
-      stored_continuous_ && !suppress_verify_ && now - repeat_started_ >= repeat_delay_ms_) {
-    repeat_wait_ = false;
-    pending_action_ = PENDING_VERIFY;
-    execute_pending_action_();
+      stored_continuous_ && !suppress_verify_) {
+    if (verify_drain_.expired(now,repeat_delay_ms_)) {
+      ESP_LOGW(TAG,"VERIFY: late reply stream did not become quiet; resetting session");
+      fail_command_(CMD_VERIFY,RES_FAILED_TIMEOUT);
+    } else if (parser_.idle() && !available() && verify_drain_.ready(now,repeat_delay_ms_)) {
+      if(verify_drain_.duplicates)
+        ESP_LOGI(TAG,"VERIFY: discarded %lu late replies; quiet interval satisfied",(unsigned long)verify_drain_.duplicates);
+      repeat_wait_=false;
+      pending_action_=PENDING_VERIFY;
+      execute_pending_action_();
+    }
   }
   recognition_watchdog_();
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
@@ -85,7 +92,7 @@ bool DFRobotAI10Component::enrollment_command_(uint8_t cmd) {
   return cmd == CMD_ENROLL_SINGLE || cmd == CMD_ENROLL_DIRECTION || cmd == CMD_ENROLL_INTERACTIVE || cmd == 0xFB || cmd == 0xF7;
 }
 void DFRobotAI10Component::invalidate_auth_() {
-  recognized_ = false; face_detected_ = false; last_uid_ = 0;
+  recognized_ = false; face_detected_ = false; palm_detected_=false; last_uid_ = 0;
   last_user_name_.clear(); last_type_ = TYPE_NONE; last_admin_ = false;
 }
 void DFRobotAI10Component::cancel_stop_() {
@@ -159,7 +166,15 @@ void DFRobotAI10Component::recognition_watchdog_() {
   ESP_LOGW(TAG,"Watchdog: requested continuous recognition is inactive");
   schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
 }
-void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
+void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result,bool device_reply) {
+  const bool draining=repeat_wait_;
+  if(cmd==CMD_VERIFY && !draining) report_verify_(result,device_reply?"sensor":"host");
+  if(cmd==CMD_VERIFY && draining) {
+    last_verify_status_="UART: ponovljeni odgovori - obnovitev";
+    ESP_LOGW(TAG,"VERIFY: late reply drain exceeded deadline");
+  }
+  if(cmd==CMD_RESET && pending_action_==PENDING_VERIFY)
+    last_verify_status_="RESET pred VERIFY neuspesen";
   repeat_wait_=false;
   const bool failed_directory=directory_active_;
   const bool failed_guided=guided_active_;
@@ -765,9 +780,20 @@ void DFRobotAI10Component::process_packet_(uint8_t msg_id, const uint8_t *payloa
 void DFRobotAI10Component::schedule_repeat_() {
   // Hold the logical VERIFY operation active so shutters and directory refresh can pause it.
   // Ignore late replies/notes between single-shot cycles.
-  repeat_wait_ = true;
-  repeat_started_ = command_started_ = millis();
-  command_timeout_ms_ = repeat_delay_ms_+3000;
+  repeat_wait_=true;
+  repeat_started_=command_started_=millis();
+  verify_drain_.begin(repeat_started_);
+  command_timeout_ms_=repeat_delay_ms_+VerifyReplyDrain::EXTRA_LIMIT_MS+1000;
+}
+void DFRobotAI10Component::report_verify_(uint8_t result,const char *source,uint16_t uid) {
+  const uint32_t elapsed=millis()-command_started_;
+  char buf[128];
+  if(uid)
+    snprintf(buf,sizeof(buf),"0x%02X %s | UID %u | %lu ms | %s",result,result_to_str_(result),uid,(unsigned long)elapsed,source);
+  else
+    snprintf(buf,sizeof(buf),"0x%02X %s | %lu ms | %s",result,result_to_str_(result),(unsigned long)elapsed,source);
+  last_verify_status_=buf;
+  ESP_LOGI(TAG,"VERIFY result: %s",buf);
 }
 void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (len < 2) {
@@ -783,6 +809,10 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
     if (result != RES_SUCCESS) { fail_command_(cmd, result); return; }
     waiting_reset_ = false; reset_confirmed_idle_=true; last_result_ = result;
     execute_pending_action_();
+    return;
+  }
+  if(cmd==CMD_VERIFY && repeat_wait_ && !waiting_reset_ && pending_cmd_==CMD_VERIFY && !suppress_verify_) {
+    verify_drain_.observe(millis());
     return;
   }
   if (waiting_reset_ || cmd != pending_cmd_ || !pending_cmd_ || (cmd == CMD_VERIFY && (suppress_verify_ || repeat_wait_))) return;
@@ -845,14 +875,15 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       // Normal negative results are expected in both recognition modes.
       if (result != RES_FAILED_UNKNOWN_USER && result != RES_FAILED_LIVE_CHECK &&
           result != RES_FAILED_TIMEOUT && result != 0x1A) {
-        fail_command_(cmd,result); return;
+        fail_command_(cmd,result,true); return;
       }
+      report_verify_(result,"sensor");
       recovery_count_=0;
       if (full_scan_) schedule_repeat_();
       else command_started_=millis();
       invalidate_auth_(); last_result_ = result;
       recognition_failed_.call(result); command_result_.call(cmd, result);
-    } else fail_command_(cmd, result);
+    } else fail_command_(cmd, result,true);
     return;
   }
   auto uid_of = [](const uint8_t *p) -> uint16_t { return uint16_t(p[0]) << 8 | p[1]; };
@@ -871,6 +902,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
         last_uid_ = uid_of(data); last_user_name_ = bounded_string(data+2,32);
         last_admin_ = data[34] != 0; last_type_ = last_uid_ > 1000 ? TYPE_PALM : TYPE_FACE;
         recognized_ = true; last_result_ = result; recovery_count_=0;
+        report_verify_(result,"sensor",last_uid_);
         if(continuous && !full_scan_) command_started_=millis();
       }
       break;
@@ -1004,21 +1036,18 @@ void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {
     on_qr_scanned_callback_.call(last_qr_data_);
     return;
   }
-  if (len >= 17 && payload[0]==1) {
-    uint8_t nid = payload[0];
-    int16_t state = (payload[1] << 8) | payload[2];
-    int16_t left = (payload[3] << 8) | payload[4];
-    int16_t top = (payload[5] << 8) | payload[6];
-    int16_t right = (payload[7] << 8) | payload[8];
-    int16_t bottom = (payload[9] << 8) | payload[10];
-
-    const char *state_str = "unknown";
-    if (state == 0x00) { state_str = "face"; this->face_detected_ = true; }
-    else if (state == (int16_t)0x80) { state_str = "palm"; this->face_detected_ = true; }
-    else { this->face_detected_ = false; }
-
-    ESP_LOGD(TAG, "NOTE: nid=%d state=%s rect=[%d,%d,%d,%d]",
-             nid, state_str, left, top, right, bottom);
+  if (len>0 && payload[0]==1) {
+    FaceNote note;
+    if(!decode_face_note(payload,len,note)) {
+      ESP_LOGD(TAG,"Malformed FACE_STATE note, length=%u",unsigned(len));
+      return;
+    }
+    // Preserve the legacy combined normal-face/palm getter; expose palm separately.
+    palm_detected_=note.palm_normal();
+    face_detected_=note.face_normal() || palm_detected_;
+    ESP_LOGD(TAG,"NOTE: nid=1 state=0x%04X (%s) rect=[%d,%d,%d,%d] pose=[%d,%d,%d]",
+      unsigned(uint16_t(note.state)),face_note_state(note.state),note.left,note.top,note.right,note.bottom,
+      note.yaw,note.pitch,note.roll);
   } else if (len >= 2) {
     // Short note — state transition updates (e.g. face exit)
     uint8_t note_type = payload[0];
@@ -1027,6 +1056,7 @@ void DFRobotAI10Component::handle_note_(const uint8_t *payload, uint16_t len) {
     // 0x0A 0x00 = Face/Object left the frame
     if (note_type == 0x0A && note_val == 0x00) {
       this->face_detected_ = false;
+      palm_detected_=false;
       this->recognized_ = false; // Reset auth state when user leaves
     }
     ESP_LOGD(TAG, "NOTE: %d bytes (type=0x%02X val=0x%02X)", len, note_type, note_val);
@@ -1070,6 +1100,8 @@ const char *DFRobotAI10Component::result_to_str_(uint8_t result) {
     case 23: return "RGB image unavailable";
     case 24: return "photo too large";
     case 25: return "photo too small";
+    case 0x1A: return "QR detected";
+    case 0x1C: return "undocumented result";
     default:                       return "unknown";
   }
 }

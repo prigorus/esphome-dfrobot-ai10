@@ -357,6 +357,15 @@ button:
 
 text_sensor:
   - platform: template
+    name: "Zadnji rezultat prepoznavanja"
+    id: ai_verify_result
+    entity_category: diagnostic
+    lambda: |-
+      auto value=id(ai10_sensor)->get_last_verify_status();
+      if(id(ai_verify_result).has_state() && id(ai_verify_result).state==value) return {};
+      return value;
+    update_interval: 1s
+  - platform: template
     name: "Stanje prepoznavanja"
     id: ai_recognition_status
     entity_category: diagnostic

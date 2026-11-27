@@ -21,6 +21,7 @@
 #include "ai10_frame.h"
 #include "ai10_directional_enrollment.h"
 #include "ai10_recognition_watchdog.h"
+#include "ai10_verify_diagnostics.h"
 
 namespace esphome {
 namespace dfrobot_ai10 {
@@ -207,6 +208,8 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   const std::string &get_last_user_name() const { return this->last_user_name_; }
   RecognitionType get_last_type() const { return this->last_type_; }
   uint8_t get_last_result() const { return this->last_result_; }
+  const std::string &get_last_verify_status() const { return last_verify_status_; }
+  bool is_palm_detected() const { return palm_detected_; }
   const std::string &get_last_qr_data() const { return this->last_qr_data_; }
   bool is_recognized() const { return this->recognized_; }
   bool is_face_detected() const { return this->face_detected_; }
@@ -239,7 +242,10 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   uint8_t last_result_{0xFF};
   std::string last_qr_data_;
   bool recognized_{false};
-  bool face_detected_{false};
+  bool face_detected_{false}, palm_detected_{false};
+  std::string last_verify_status_{"Ni rezultata"};
+  VerifyReplyDrain verify_drain_;
+  void report_verify_(uint8_t result,const char *source,uint16_t uid=0);
   uint16_t user_count_{0};
   std::vector<uint16_t> user_ids_;
   bool user_list_complete_{false};
@@ -288,7 +294,7 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void queue_extended_(uint8_t cmd, std::vector<uint8_t> data, uint32_t timeout_ms = 3000);
   void transmit_reset_();
   void invalidate_auth_();
-  void fail_command_(uint8_t cmd, uint8_t result);
+  void fail_command_(uint8_t cmd, uint8_t result, bool device_reply=false);
   void cancel_stop_();
   bool prepare_(PendingAction action);
   static bool enrollment_command_(uint8_t cmd);
