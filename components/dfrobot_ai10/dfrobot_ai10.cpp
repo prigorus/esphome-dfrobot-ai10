@@ -22,6 +22,8 @@ void DFRobotAI10Component::dump_config() {
   ESP_LOGCONFIG(TAG, "DFRobot AI10 (SEN0677):");
   ESP_LOGCONFIG(TAG, "  Protocol: SyncWord=0xEF 0xAA, XOR checksum");
   this->check_uart_settings(115200);
+  ESP_LOGCONFIG(TAG,"  Recognition mode: %s; watchdog: %s; repeat gap: %lu ms",
+      full_scan_?"FULL":"ECO",recovery_enabled_?"ON":"OFF",(unsigned long)repeat_delay_ms_);
 }
 
 void DFRobotAI10Component::loop() {
@@ -152,15 +154,9 @@ void DFRobotAI10Component::recognition_watchdog_() {
   watchdog_at_=now;
   if(!recognition_intent_.may_recover(recovery_enabled_,setup_done_,
       stop_in_progress_ || guided_active_ || capture_cycle_active_,false)) return;
-  if(is_continuous_recognition_active()) {
-    // ECO can legitimately be silent when nobody is present. Renew the session
-    // periodically rather than treating silence as proof of hardware failure.
-    if(!full_scan_ && elapsed_at_least(now,command_started_,ECO_RENEW_MS)) {
-      ESP_LOGI(TAG,"Watchdog: renewing ECO session after 10 minutes without a verification result");
-      fail_command_(CMD_VERIFY,RES_FAILED_TIMEOUT);
-    }
-    return;
-  }
+  // Never interrupt an active recognition session, including a quiet ECO session.
+  // FULL has its own existing per-command timeout; no speculative renewal here.
+  if(is_continuous_recognition_active()) return;
   if(is_busy() || directory_active_ || refresh_queued_ || pending_action_!=PENDING_NONE) return;
   ESP_LOGW(TAG,"Watchdog: requested continuous recognition is inactive");
   schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
@@ -181,6 +177,14 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result,bool device
   const bool enroll=enrollment_command_(cmd) || (cmd==CMD_RESET && (pending_action_==PENDING_ENROLL ||
       (pending_action_==PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
   const bool verify=cmd==CMD_VERIFY || (cmd==CMD_RESET && pending_action_==PENDING_VERIFY);
+  // A documented negative enrollment result is a completed command, not a
+  // communication failure. Resume the prior session without the recovery probe.
+  const bool normal_enroll_rejection=enroll && device_reply &&
+      (result==RES_FAILED_FACE_ENROLLED || result==RES_FAILED_TIMEOUT ||
+       result==RES_FAILED_MAX_USER || result==RES_FAILED_LIVE_CHECK);
+  const bool resume_after_rejection=normal_enroll_rejection && !failed_guided &&
+      recognition_intent_.wanted && resume_pending_;
+  const bool recover_transport=verify || recovery_check_ || (!device_reply && !failed_guided);
   // Never retry the failed operation. Preserve only the separate continuous intent.
   // An incomplete guided enrollment requires explicit operator review.
   if(failed_guided) recognition_intent_.stop();
@@ -202,7 +206,8 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result,bool device
   recovery_check_=false; reset_confirmed_idle_=false;
   clear_transfer_();
   suppress_verify_=true; invalidate_auth_(); last_result_=result;
-  if(recognition_intent_.wanted) schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
+  if(recognition_intent_.wanted && recover_transport && !normal_enroll_rejection)
+    schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
   if(enroll) enrollment_failed_.call(result);
   if(failed_guided) {
     ESP_LOGW(TAG,"Directional enrollment aborted: mask=0x%02X UID=%u result=0x%02X; inspect directory before restarting",guided_.mask,guided_.uid,result);
@@ -211,6 +216,11 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result,bool device
   if(verify) recognition_failed_.call(result);
   if(failed_directory) user_directory_failed_.call(result);
   command_result_.call(cmd,result);
+  if(resume_after_rejection && recognition_intent_.wanted && !is_busy() &&
+      !stop_in_progress_ && !capture_cycle_active_) {
+    ESP_LOGI(TAG,"Enrollment rejected by sensor; resuming previous recognition");
+    start_requested_recognition();
+  }
 }
 void DFRobotAI10Component::transmit_reset_() {
   uint8_t data[] = {CMD_RESET, 0, 0};
@@ -654,7 +664,7 @@ void DFRobotAI10Component::execute_pending_action_() {
       send_packet_(data, max_attempts_ < 0 ? 5 : 6);
       this->pending_cmd_ = CMD_VERIFY;
       this->recognized_ = false; // Reset auth state on new verify start
-      ESP_LOGI(TAG, "CMD: VERIFY (0x12) continuous=%d timeout=%ds", this->stored_continuous_, this->stored_timeout_);
+      ESP_LOGI(TAG, "CMD: VERIFY (0x12) continuous=%d timeout=%ds attempts=%d watchdog=%d", this->stored_continuous_, this->stored_timeout_, int(max_attempts_), recovery_enabled_);
       break;
     }
 
@@ -879,12 +889,16 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
   if (result != RES_SUCCESS) {
     if (continuous) {
       // Normal negative results are expected in both recognition modes.
+      // 0x1C is undocumented, but hardware has returned it in a valid VERIFY
+      // reply. In FULL it ends this attempt as a NON-match, without RESET.
+      // Do not assume meaning, authorize, or count it as a valid identity.
+      const bool undocumented_full_result=full_scan_ && result==0x1C && n==0;
       if (result != RES_FAILED_UNKNOWN_USER && result != RES_FAILED_LIVE_CHECK &&
-          result != RES_FAILED_TIMEOUT && result != 0x1A) {
+          result != RES_FAILED_TIMEOUT && result != 0x1A && !undocumented_full_result) {
         fail_command_(cmd,result,true); return;
       }
       report_verify_(result,"sensor");
-      recovery_count_=0;
+      if(!undocumented_full_result) recovery_count_=0;
       if (full_scan_) schedule_repeat_();
       else command_started_=millis();
       invalidate_auth_(); last_result_ = result;

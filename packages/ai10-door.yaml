@@ -10,7 +10,7 @@ substitutions:
   ai10_max_recognition_attempts: "-1" # -1 = firmware default; 0..255 sends third byte
   ai10_recognition_mode: "eco"
   ai10_repeat_delay_ms: "1000"
-  ai10_recognition_recovery: "true"
+  ai10_recognition_recovery: "false" # opt-in until physical regression is resolved
   ai10_fast_capture: "false"
   ai10_incremental_directory: "false"
   ai10_snapshot_resolution: "240x320"
