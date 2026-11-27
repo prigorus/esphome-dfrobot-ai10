@@ -60,22 +60,21 @@ void DFRobotAI10Component::loop() {
   if (guided_active_ && guided_wait_ && !waiting_reset_ && pending_cmd_==CMD_ENROLL_DIRECTION &&
       now-guided_next_at_>=1200) send_guided_direction_();
   if (recovery_pending_ && elapsed_at_least(now,recovery_at_,recovery_delay_ms_)) run_recovery_();
-  if (refresh_queued_ && setup_done_ && !waiting_reset_ && !recovery_pending_ && !stop_in_progress_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
+  // Directory refresh has priority over an idle scheduled recovery; otherwise
+  // refresh_queued_ and recovery_pending_ can prevent each other from running.
+  if (refresh_queued_ && setup_done_ && !waiting_reset_ && !recovery_check_ && !stop_in_progress_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
     refresh_queued_ = false;
     refresh_users();
   }
+  // Restore the original fixed repeat interval after the quiet-window regression.
+  // Count and ignore replies during the gap, but never block the next cycle on silence.
   if (repeat_wait_ && !waiting_reset_ && pending_cmd_ == CMD_VERIFY &&
-      stored_continuous_ && !suppress_verify_) {
-    if (verify_drain_.expired(now,repeat_delay_ms_)) {
-      ESP_LOGW(TAG,"VERIFY: late reply stream did not become quiet; resetting session");
-      fail_command_(CMD_VERIFY,RES_FAILED_TIMEOUT);
-    } else if (parser_.idle() && !available() && verify_drain_.ready(now,repeat_delay_ms_)) {
-      if(verify_drain_.duplicates)
-        ESP_LOGI(TAG,"VERIFY: discarded %lu late replies; quiet interval satisfied",(unsigned long)verify_drain_.duplicates);
-      repeat_wait_=false;
-      pending_action_=PENDING_VERIFY;
-      execute_pending_action_();
-    }
+      stored_continuous_ && !suppress_verify_ && millis()-repeat_started_>=repeat_delay_ms_) {
+    if(verify_drain_.duplicates)
+      ESP_LOGI(TAG,"VERIFY: discarded %lu late replies during repeat gap",(unsigned long)verify_drain_.duplicates);
+    repeat_wait_=false;
+    pending_action_=PENDING_VERIFY;
+    execute_pending_action_();
   }
   recognition_watchdog_();
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
@@ -170,8 +169,8 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result,bool device
   const bool draining=repeat_wait_;
   if(cmd==CMD_VERIFY && !draining) report_verify_(result,device_reply?"sensor":"host");
   if(cmd==CMD_VERIFY && draining) {
-    last_verify_status_="UART: ponovljeni odgovori - obnovitev";
-    ESP_LOGW(TAG,"VERIFY: late reply drain exceeded deadline");
+    last_verify_status_="VERIFY premor prekinjen";
+    ESP_LOGW(TAG,"VERIFY: repeat gap interrupted");
   }
   if(cmd==CMD_RESET && pending_action_==PENDING_VERIFY)
     last_verify_status_="RESET pred VERIFY neuspesen";
@@ -241,9 +240,16 @@ void DFRobotAI10Component::reset_operation_() {
   if(cancelled_guided) directional_enrollment_.call(0,guided_.mask,guided_.uid,RES_ABORTED);
 }
 bool DFRobotAI10Component::prepare_(PendingAction action) {
-  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_pending_ || stop_in_progress_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_check_ || stop_in_progress_ ||
+      (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "Module busy or booting; command rejected");
     return false;
+  }
+  // An idle scheduled retry is not a UART transaction. An explicit command may
+  // supersede the wait; the independent continuous intent survives temporary work.
+  if(recovery_pending_) {
+    recovery_pending_=false;
+    ESP_LOGI(TAG,"Explicit command supersedes scheduled recognition retry");
   }
   if (action == PENDING_ENROLL || action == PENDING_DELETE_USER || action == PENDING_DELETE_ALL ||
       (action == PENDING_EXTENDED && auto_refresh_users_))
@@ -365,7 +371,7 @@ void DFRobotAI10Component::schedule_directory_refresh_() {
 }
 void DFRobotAI10Component::refresh_users() {
   // Keep one outstanding request; never overlap user-detail replies.
-  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_pending_ || stop_in_progress_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
+  if (!setup_done_ || waiting_reset_ || guided_active_ || recovery_check_ || stop_in_progress_ || directory_active_ || (pending_cmd_ && pending_cmd_ != CMD_VERIFY)) {
     ESP_LOGW(TAG, "User directory refresh rejected: module busy or booting");
     return;
   }
@@ -783,7 +789,7 @@ void DFRobotAI10Component::schedule_repeat_() {
   repeat_wait_=true;
   repeat_started_=command_started_=millis();
   verify_drain_.begin(repeat_started_);
-  command_timeout_ms_=repeat_delay_ms_+VerifyReplyDrain::EXTRA_LIMIT_MS+1000;
+  command_timeout_ms_=repeat_delay_ms_+3000;
 }
 void DFRobotAI10Component::report_verify_(uint8_t result,const char *source,uint16_t uid) {
   const uint32_t elapsed=millis()-command_started_;
