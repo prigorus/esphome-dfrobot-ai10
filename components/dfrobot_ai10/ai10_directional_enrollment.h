@@ -18,9 +18,16 @@ struct DirectionalEnrollment {
     if(n!=3 || step>=5) return INVALID;
     const uint16_t received=uint16_t(data[0])<<8|data[1];
     const uint8_t expected=mask|direction(step);
-    if(!received || received>1000 || existing_uid ||
-        (uid && received!=uid) || data[2]!=expected) return INVALID;
-    uid=received;mask=expected;++step;
+    if(data[2]!=expected) return INVALID;
+    // Hardware v2.30-QRXF-PV returned FFFF with a successful first direction.
+    // Treat it only as a provisional UID, never as a registered identity.
+    if(received==0xFFFF) {
+      if(expected==ALL || uid || existing_uid) return INVALID;
+    } else {
+      if(!received || received>1000 || existing_uid || (uid && received!=uid)) return INVALID;
+      uid=received;
+    }
+    mask=expected;++step;
     return mask==ALL?COMPLETE:NEXT;
   }
 };
