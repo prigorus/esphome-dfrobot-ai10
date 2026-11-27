@@ -24,14 +24,14 @@ esphome:
           id: ai_unlock_pulse
           state: false
       - delay: 6s
-      - lambda: id(ai10_sensor)->refresh_users();
+      - lambda: |-
+          id(ai10_sensor)->arm_auto_recognition(${ai10_timeout}, ${ai10_max_recognition_attempts});
+          id(ai10_sensor)->refresh_users();
       - wait_until:
           condition:
             lambda: return !id(ai10_sensor)->is_busy();
           timeout: 25s
-      - lambda: |-
-          if (!id(ai10_sensor)->is_busy())
-            id(ai10_sensor)->start_configured_recognition(${ai10_timeout}, true, ${ai10_max_recognition_attempts});
+      - lambda: id(ai10_sensor)->start_requested_recognition();
 
 dfrobot_ai10:
   id: ai10_sensor
@@ -356,6 +356,15 @@ button:
           if (!id(ai10_camera)->is_auto_capture_active()) id(ai10_sensor)->test_ir_uvc(false);
 
 text_sensor:
+  - platform: template
+    name: "Stanje prepoznavanja"
+    id: ai_recognition_status
+    entity_category: diagnostic
+    lambda: |-
+      auto value=id(ai10_sensor)->get_recognition_status();
+      if(id(ai_recognition_status).has_state() && id(ai_recognition_status).state==value) return {};
+      return value;
+    update_interval: 5s
   - platform: template
     name: "Stanje arhiviranja fotografije"
     id: ai_archive_status

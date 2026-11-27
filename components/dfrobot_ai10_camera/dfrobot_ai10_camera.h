@@ -58,7 +58,7 @@ class AI10SnapshotCamera : public camera::Camera {
   bool is_auto_capture_enabled() const { return auto_enabled_; }
   uint8_t get_failed_count() const { return failure_count_; }
   bool is_auto_capture_active() const { return phase_!=IDLE; }
-  void cancel_auto_capture() { phase_=IDLE; failure_count_=0; }
+  void cancel_auto_capture() { set_phase_(IDLE); failure_count_=0; }
   void set_fallback_snapshot(bool enabled) { fallback_snapshot_=enabled; }
   void set_archive_retry_interval(uint32_t ms) { retry_ms_=ms; }
   void add_on_archive_request_callback(std::function<void(std::string)> &&cb) { archive_request_.add(std::move(cb)); }

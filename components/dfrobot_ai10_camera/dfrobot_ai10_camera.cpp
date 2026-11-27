@@ -14,7 +14,7 @@ static const char *const TAG = "ai10_camera";
 void AI10SnapshotCamera::setup() {
   parent_->add_on_recognized_callback([this](std::string, uint16_t) {
     failure_count_=0;
-    if (phase_==QUEUED) phase_=IDLE;
+    if (phase_==QUEUED) set_phase_(IDLE);
   });
   parent_->add_on_recognition_failed_callback([this](uint8_t result) {
     if (!auto_enabled_ || !failure_threshold_ || phase_!=IDLE ||
@@ -184,6 +184,7 @@ void AI10SnapshotCamera::stop_stream(camera::CameraRequester requester) {
 }
 void AI10SnapshotCamera::set_phase_(Phase phase) {
   phase_=phase; phase_started_=millis();
+  parent_->set_capture_cycle_active(phase!=IDLE);
 }
 void AI10SnapshotCamera::finish_auto_capture_() {
   if (archive_capture_ && last_capture_succeeded_) {
@@ -217,7 +218,7 @@ void AI10SnapshotCamera::auto_capture_loop_() {
     case FACE:
       if (!capturing_) {
         if (last_capture_succeeded_ || !archive_capture_ || !fallback_snapshot_) finish_auto_capture_();
-        else { parent_->send_reset(); set_phase_(WAIT_FALLBACK); }
+        else { parent_->reset_for_capture(); set_phase_(WAIT_FALLBACK); }
       }
       break;
     case WAIT_FALLBACK:
@@ -287,7 +288,7 @@ void AI10SnapshotCamera::loop() {
   uint32_t now=millis();
   if (capturing_ && !parent_->is_image_transfer_active()) fail_("Capture cancelled");
   if (capturing_ && now-capture_start_>60000) {
-    parent_->send_reset();
+    parent_->reset_for_capture();
     fail_("Capture deadline exceeded");
   }
   auto_capture_loop_();

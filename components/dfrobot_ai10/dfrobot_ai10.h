@@ -20,6 +20,7 @@
 #include "ai10_users.h"
 #include "ai10_frame.h"
 #include "ai10_directional_enrollment.h"
+#include "ai10_recognition_watchdog.h"
 
 namespace esphome {
 namespace dfrobot_ai10 {
@@ -138,6 +139,12 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   void set_recovery_enabled(bool value) { recovery_enabled_ = value; }
   void set_fast_capture(bool value) { fast_capture_ = value; }
   void pause_for_capture();
+  void reset_for_capture();
+  void set_capture_cycle_active(bool value) { capture_cycle_active_=value; }
+  // Arm once during boot; a slow initial directory read must not lose the request.
+  void arm_auto_recognition(uint8_t timeout,int attempts);
+  void start_requested_recognition();
+  std::string get_recognition_status() const;
   void set_incremental_directory(bool value) { incremental_directory_ = value; }
   void delete_user(uint16_t uid);
   void delete_all_users();
@@ -298,7 +305,13 @@ class DFRobotAI10Component : public Component, public uart::UARTDevice {
   bool recovery_enabled_{false}, recovery_pending_{false}, recovery_check_{false};
   uint8_t recovery_count_{0}, recovery_timeout_{30};
   int16_t recovery_attempts_{-1};
-  uint32_t recovery_at_{0};
+  uint32_t recovery_at_{0}, recovery_delay_ms_{1500}, watchdog_at_{0};
+  RecognitionIntent recognition_intent_;
+  bool capture_cycle_active_{false};
+  static constexpr uint32_t ECO_RENEW_MS=600000;
+  void recognition_watchdog_();
+  void reset_operation_();
+  void stop_operation_();
   void schedule_recovery_(uint8_t timeout, int16_t attempts);
   void cancel_recovery_();
   void run_recovery_();

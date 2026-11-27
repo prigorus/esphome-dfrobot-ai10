@@ -11,7 +11,7 @@ void DFRobotAI10Component::setup() {
   // This is in setup(), so blocking here is acceptable and safer for init sequence.
   this->set_timeout("ai10_boot", 3000, [this]() {
     this->setup_done_ = true;
-    this->send_reset();
+    this->reset_operation_();
   });
 
   // Send initial reset (mirrors Arduino library begin())
@@ -59,7 +59,7 @@ void DFRobotAI10Component::loop() {
   now=millis();
   if (guided_active_ && guided_wait_ && !waiting_reset_ && pending_cmd_==CMD_ENROLL_DIRECTION &&
       now-guided_next_at_>=1200) send_guided_direction_();
-  if (recovery_pending_ && now-recovery_at_ >= 1500) run_recovery_();
+  if (recovery_pending_ && elapsed_at_least(now,recovery_at_,recovery_delay_ms_)) run_recovery_();
   if (refresh_queued_ && setup_done_ && !waiting_reset_ && !recovery_pending_ && !stop_in_progress_ && (!pending_cmd_ || pending_cmd_ == CMD_VERIFY)) {
     refresh_queued_ = false;
     refresh_users();
@@ -70,6 +70,7 @@ void DFRobotAI10Component::loop() {
     pending_action_ = PENDING_VERIFY;
     execute_pending_action_();
   }
+  recognition_watchdog_();
   if (this->setup_done_ && now - this->last_status_log_ > 10000) {
     this->last_status_log_ = now;
     ESP_LOGD(TAG, "Parser state: %s, last result: %s",
@@ -95,25 +96,68 @@ void DFRobotAI10Component::cancel_stop_() {
 void DFRobotAI10Component::cancel_recovery_() {
   recovery_pending_=false; recovery_check_=false; recovery_count_=0;
 }
-void DFRobotAI10Component::schedule_recovery_(uint8_t timeout,int16_t attempts) {
-  if (!recovery_enabled_ || !timeout || stop_in_progress_) return;
-  if (recovery_count_>=3) {
-    ESP_LOGE(TAG,"Recognition recovery exhausted; start manually");
-    recovery_pending_=false; recovery_check_=false; return;
+void DFRobotAI10Component::arm_auto_recognition(uint8_t timeout,int attempts) {
+  if(!recognition_intent_.arm(timeout,attempts)) ESP_LOGW(TAG,"Invalid automatic recognition settings");
+}
+void DFRobotAI10Component::start_requested_recognition() {
+  if(recognition_intent_.wanted && setup_done_ && !is_busy() && !stop_in_progress_ &&
+      !refresh_queued_ && !directory_active_ && !capture_cycle_active_)
+    start_configured_recognition(recognition_intent_.timeout,true,recognition_intent_.attempts);
+}
+std::string DFRobotAI10Component::get_recognition_status() const {
+  if(!setup_done_) return "Inicializacija";
+  if(guided_active_) return "Registracija obraza";
+  if(capture_cycle_active_) return "Zajem fotografije";
+  if(stop_in_progress_) return "Ustavljanje";
+  if(!recognition_intent_.wanted) {
+    if(pending_cmd_==CMD_VERIFY && !suppress_verify_) return "Enkratno prepoznavanje";
+    return "Samodejno ustavljeno";
   }
+  if(recovery_pending_) return "Obnovitev - premor " + std::to_string(recovery_delay_ms_/1000) + " s";
+  if(recovery_check_) return "Obnovitev - preverjanje modula";
+  if(is_continuous_recognition_active()) return full_scan_ ? (repeat_wait_?"FULL - premor":"FULL - cikel") : "ECO - cikel";
+  if(waiting_reset_ || pending_cmd_ || refresh_queued_ || directory_active_) return "Zacasno prekinjeno";
+  return recovery_enabled_ ? "Cakanje na watchdog" : "Neaktivno - watchdog izklopljen";
+}
+void DFRobotAI10Component::schedule_recovery_(uint8_t timeout,int16_t attempts) {
+  if (!recognition_intent_.may_recover(recovery_enabled_,setup_done_,
+      stop_in_progress_ || guided_active_ || capture_cycle_active_, recovery_pending_) || !timeout) return;
   recovery_timeout_=timeout; recovery_attempts_=attempts;
   recovery_pending_=true; recovery_check_=false; recovery_at_=millis();
-  ESP_LOGW(TAG,"Recognition recovery scheduled (%u/3)",unsigned(recovery_count_+1));
+  recovery_delay_ms_=recovery_delay_ms(recovery_count_);
+  ESP_LOGW(TAG,"Recognition recovery scheduled in %lu ms (failure streak tier %u)",
+      (unsigned long)recovery_delay_ms_,unsigned(recovery_count_));
 }
 void DFRobotAI10Component::run_recovery_() {
-  if (!recovery_pending_ || waiting_reset_ || pending_cmd_ || stop_in_progress_) return;
+  if (!recovery_pending_ || !recognition_intent_.may_recover(recovery_enabled_,setup_done_,
+      stop_in_progress_ || guided_active_ || capture_cycle_active_,
+      waiting_reset_ || pending_cmd_ || directory_active_ || refresh_queued_ || pending_action_!=PENDING_NONE)) return;
   recovery_pending_=false;
-  ++recovery_count_;
+  recovery_count_=next_recovery_count(recovery_count_);
   recovery_check_=true;
   suppress_verify_=true; invalidate_auth_();
   pending_action_=PENDING_EXTENDED;
   extended_cmd_=CMD_STATUS; extended_data_.clear(); extended_timeout_ms_=3000;
   transmit_reset_();
+}
+void DFRobotAI10Component::recognition_watchdog_() {
+  const uint32_t now=millis();
+  if(!elapsed_at_least(now,watchdog_at_,10000)) return;
+  watchdog_at_=now;
+  if(!recognition_intent_.may_recover(recovery_enabled_,setup_done_,
+      stop_in_progress_ || guided_active_ || capture_cycle_active_,false)) return;
+  if(is_continuous_recognition_active()) {
+    // ECO can legitimately be silent when nobody is present. Renew the session
+    // periodically rather than treating silence as proof of hardware failure.
+    if(!full_scan_ && elapsed_at_least(now,command_started_,ECO_RENEW_MS)) {
+      ESP_LOGI(TAG,"Watchdog: renewing ECO session after 10 minutes without a verification result");
+      fail_command_(CMD_VERIFY,RES_FAILED_TIMEOUT);
+    }
+    return;
+  }
+  if(is_busy() || directory_active_ || refresh_queued_ || pending_action_!=PENDING_NONE) return;
+  ESP_LOGW(TAG,"Watchdog: requested continuous recognition is inactive");
+  schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
 }
 void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   repeat_wait_=false;
@@ -123,10 +167,11 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   const bool enroll=enrollment_command_(cmd) || (cmd==CMD_RESET && (pending_action_==PENDING_ENROLL ||
       (pending_action_==PENDING_EXTENDED && enrollment_command_(extended_cmd_))));
   const bool verify=cmd==CMD_VERIFY || (cmd==CMD_RESET && pending_action_==PENDING_VERIFY);
-  // Only restore a previously active continuous session. Never retry the failed operation.
-  const bool restore=!failed_guided && (recovery_check_ || (verify && stored_continuous_) || resume_pending_ || config_test_resume_);
-  const uint8_t timeout=recovery_check_?recovery_timeout_:(config_test_resume_?config_test_timeout_:(resume_pending_?resume_timeout_:stored_timeout_));
-  const int16_t attempts=recovery_check_?recovery_attempts_:(config_test_resume_?config_test_attempts_:(resume_pending_?resume_attempts_:max_attempts_));
+  // Never retry the failed operation. Preserve only the separate continuous intent.
+  // An incomplete guided enrollment requires explicit operator review.
+  if(failed_guided) recognition_intent_.stop();
+  ESP_LOGW(TAG,"Command failed: cmd=0x%02X result=0x%02X auto_requested=%d",
+      cmd,result,recognition_intent_.wanted);
   if(config_test_phase_) {
     ESP_LOGW(TAG,"AI10 test interrupted: cmd=0x%02X result=0x%02X",cmd,result);
     if(config_test_phase_==3) send_extended_packet_(0xF9,{3});
@@ -143,7 +188,7 @@ void DFRobotAI10Component::fail_command_(uint8_t cmd, uint8_t result) {
   recovery_check_=false; reset_confirmed_idle_=false;
   clear_transfer_();
   suppress_verify_=true; invalidate_auth_(); last_result_=result;
-  if(restore) schedule_recovery_(timeout,attempts);
+  if(recognition_intent_.wanted) schedule_recovery_(recognition_intent_.timeout,recognition_intent_.attempts);
   if(enroll) enrollment_failed_.call(result);
   if(failed_guided) {
     ESP_LOGW(TAG,"Directional enrollment aborted: mask=0x%02X UID=%u result=0x%02X; inspect directory before restarting",guided_.mask,guided_.uid,result);
@@ -159,8 +204,14 @@ void DFRobotAI10Component::transmit_reset_() {
   send_packet_(data, sizeof(data));
 }
 void DFRobotAI10Component::send_reset() {
+  recognition_intent_.stop();
+  reset_operation_();
+}
+void DFRobotAI10Component::reset_for_capture() { reset_operation_(); }
+void DFRobotAI10Component::reset_operation_() {
   const bool cancelled_guided=guided_active_;
   if(cancelled_guided) {
+    recognition_intent_.stop();
     guided_active_=false; guided_wait_=false;
     invalidate_guided_directory_();
   }
@@ -189,7 +240,11 @@ bool DFRobotAI10Component::prepare_(PendingAction action) {
   return true;
 }
 void DFRobotAI10Component::stop_recognition() {
-  send_reset();
+  recognition_intent_.stop();
+  stop_operation_();
+}
+void DFRobotAI10Component::stop_operation_() {
+  reset_operation_();
   stop_in_progress_ = true;
   // Preserve the upstream firmware workaround without treating its reply as authorization.
   set_timeout("ai10_stop_override", 80, [this]() {
@@ -197,22 +252,26 @@ void DFRobotAI10Component::stop_recognition() {
     uint8_t data[] = {CMD_VERIFY, 0, 2, 0, 1};
     send_packet_(data, sizeof(data));
   });
-  set_timeout("ai10_stop_final", 1500, [this]() { send_reset(); });
+  set_timeout("ai10_stop_final", 1500, [this]() { reset_operation_(); });
 }
 void DFRobotAI10Component::pause_for_capture() {
-  if (fast_capture_) send_reset();
-  else stop_recognition();
+  if (fast_capture_) reset_for_capture();
+  else stop_operation_();
 }
 void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous) {
   if (!timeout || !prepare_(PENDING_VERIFY)) return;
   cancel_recovery_();
   stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = -1;
+  if(continuous) recognition_intent_.arm(timeout,-1);
+  else recognition_intent_.stop();
   transmit_reset_();
 }
 void DFRobotAI10Component::start_recognition(uint8_t timeout, bool continuous, uint8_t max_attempts) {
   if (!timeout || !prepare_(PENDING_VERIFY)) return;
   cancel_recovery_();
   stored_timeout_ = timeout; stored_continuous_ = continuous; max_attempts_ = max_attempts;
+  if(continuous) recognition_intent_.arm(timeout,max_attempts);
+  else recognition_intent_.stop();
   transmit_reset_();
 }
 void DFRobotAI10Component::enroll_user(uint8_t admin, const char *name, uint8_t timeout) {
@@ -318,7 +377,7 @@ void DFRobotAI10Component::finish_directory_() {
   uint8_t timeout = resume_timeout_;
   int16_t attempts = resume_attempts_;
   // Resume only after successful refresh; authorization remains cleared.
-  if (resume) {
+  if (resume && recognition_intent_.wanted) {
     if (attempts < 0) start_recognition(timeout,true);
     else start_recognition(timeout,true,uint8_t(attempts));
   }
@@ -382,7 +441,7 @@ void DFRobotAI10Component::finish_config_test_(uint8_t cmd, uint8_t result) {
   pending_cmd_ = 0; last_result_ = result;
   command_result_.call(cmd,result);
   // The LED command has no confirmed reply; verify liveness via reset/status before resuming.
-  if (resume && !is_busy() && !stop_in_progress_) {
+  if (resume && recognition_intent_.wanted && !is_busy() && !stop_in_progress_) {
     if (cmd==0xF9 && recovery_enabled_) schedule_recovery_(timeout,attempts);
     else start_configured_recognition(timeout,true,attempts);
   }
@@ -790,6 +849,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
       }
       recovery_count_=0;
       if (full_scan_) schedule_repeat_();
+      else command_started_=millis();
       invalidate_auth_(); last_result_ = result;
       recognition_failed_.call(result); command_result_.call(cmd, result);
     } else fail_command_(cmd, result);
@@ -811,6 +871,7 @@ void DFRobotAI10Component::handle_reply_(const uint8_t *payload, uint16_t len) {
         last_uid_ = uid_of(data); last_user_name_ = bounded_string(data+2,32);
         last_admin_ = data[34] != 0; last_type_ = last_uid_ > 1000 ? TYPE_PALM : TYPE_FACE;
         recognized_ = true; last_result_ = result; recovery_count_=0;
+        if(continuous && !full_scan_) command_started_=millis();
       }
       break;
     case CMD_SCAN_QR_CODE:
